@@ -257,6 +257,7 @@ nvc0_destroy(struct pipe_context *pipe)
    nouveau_pushbuf_bufctx(nvc0->base.pushbuf, NULL);
    PUSH_KICK(nvc0->base.pushbuf);
 
+   nvc0_zcull_fini(nvc0);
    nvc0_context_unreference_resources(nvc0);
    nvc0_blitctx_destroy(nvc0);
 
@@ -437,6 +438,25 @@ nvc0_create(struct pipe_screen *pscreen, void *priv, unsigned ctxflags)
       goto out_err;
 
    nvc0->screen = screen;
+
+   /* ZCULL geometry of the GF106 (NVC3), read from the GPC0 zcull
+    * registers of a Quadro 2000M: 4 TPCs, 4 zcull banks, 2048 aliquots.
+    */
+   if (screen->base.device->chipset == 0xc3 &&
+       debug_get_bool_option("NVC0_ZCULL", false)) {
+      nvc0->zcull.enable = true;
+      nvc0->zcull.debug = debug_get_bool_option("NVC0_ZCULL_DEBUG", false);
+      nvc0->zcull.aliquot_total = 2048;
+      nvc0->zcull.pixel_squares_by_aliquots = 1024;
+      nvc0->zcull.width_align = 64;
+      nvc0->zcull.height_align = 32;
+      /* Save storage: 32 bytes per aliquot per GPC plus a 32 byte
+       * header per GPC; the header is sized for the family's four GPCs.
+       */
+      nvc0->zcull.bytes_per_aliquot = 32;
+      nvc0->zcull.header_bytes = 4 * 32;
+      nvc0->zcull.cur = -1;
+   }
    pipe->screen = pscreen;
    pipe->priv = priv;
    pipe->stream_uploader = u_upload_create_default(pipe);

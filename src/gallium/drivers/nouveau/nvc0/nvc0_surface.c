@@ -216,6 +216,8 @@ nvc0_resource_copy_region(struct pipe_context *pipe,
    bool m2mf;
    unsigned dst_layer = dstz, src_layer = src_box->z;
 
+   nvc0_zcull_forget(nvc0_context(pipe), dst);
+
    if (dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
       nouveau_copy_buffer(&nvc0->base,
                           nv04_resource(dst), dstx,
@@ -637,6 +639,8 @@ nvc0_clear_depth_stencil(struct pipe_context *pipe,
    int unk = mt->base.base.target == PIPE_TEXTURE_2D;
    unsigned z;
 
+   nvc0_zcull_forget(nvc0_context(pipe), dst->texture);
+
    assert(dst->texture->target != PIPE_BUFFER);
 
    if (!PUSH_SPACE(push, 32 + sf->depth))
@@ -769,6 +773,13 @@ nvc0_clear(struct pipe_context *pipe, unsigned buffers,
          PUSH_DATA(push, (mode & 0x3c) | (k << NVC0_3D_CLEAR_BUFFERS_LAYER__SHIFT));
       }
    }
+
+   if (buffers & PIPE_CLEAR_DEPTH)
+      nvc0_zcull_cleared(nvc0, !scissor_state ||
+                               (scissor_state->minx == 0 &&
+                                scissor_state->miny == 0 &&
+                                scissor_state->maxx >= fb->width &&
+                                scissor_state->maxy >= fb->height), -1);
 
    for (i = 1; i < fb->nr_cbufs; i++) {
       const struct pipe_surface *sf = &fb->cbufs[i];
@@ -1647,6 +1658,8 @@ nvc0_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    struct nvc0_context *nvc0 = nvc0_context(pipe);
    struct nouveau_pushbuf *push = nvc0->base.pushbuf;
    bool eng3d = false;
+
+   nvc0_zcull_forget(nvc0_context(pipe), info->dst.resource);
 
    if (info->src.box.width == 0 || info->src.box.height == 0 ||
        info->dst.box.width == 0 || info->dst.box.height == 0) {

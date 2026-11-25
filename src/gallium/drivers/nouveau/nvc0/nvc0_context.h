@@ -173,6 +173,8 @@ struct nvc0_resident {
    uint32_t flags;
 };
 
+#define NVC0_ZCULL_SLOTS 8
+
 struct nvc0_context {
    struct nouveau_context base;
 
@@ -251,6 +253,37 @@ struct nvc0_context {
    unsigned viewports_dirty;
    struct pipe_clip_state clip;
    struct nvc0_window_rect_stateobj window_rect;
+
+   /* ZCULL (NVC0_ZCULL=1).  Each depth buffer seen gets a slot, which is
+    * also its hardware region number.  A slot that holds a range of the
+    * zcull RAM ("resident") keeps culling data while other depth buffers
+    * are rendered to; when the RAM runs out, the least recently used
+    * region is saved to its storage buffer and its range is reused.
+    */
+   struct {
+      bool enable;       /* requested and the chip's numbers are known */
+      bool debug;
+      int cur;           /* slot the hardware region belongs to, or -1 */
+      unsigned tick;
+      unsigned aliquot_total;
+      unsigned pixel_squares_by_aliquots;
+      unsigned width_align, height_align;
+      unsigned bytes_per_aliquot, header_bytes;
+      struct nvc0_zcull_slot {
+         struct pipe_resource *res; /* referenced */
+         unsigned level, layer;
+         unsigned width, height, layers, zformat;
+         unsigned aliquots;  /* all layers */
+         unsigned start;     /* first aliquot, when resident */
+         unsigned stored_start; /* where the saved data came from */
+         bool resident;
+         struct nouveau_bo *storage;
+         bool stored;    /* storage holds this buffer's zcull data */
+         bool stale;     /* depth changed behind the region's back */
+         unsigned last_use;
+      } slot[NVC0_ZCULL_SLOTS];
+      unsigned stat_setup, stat_store, stat_load, stat_clear, stat_forget;
+   } zcull;
 
    unsigned sample_mask;
    unsigned min_samples;
@@ -375,6 +408,9 @@ bool nvc0_state_validate(struct nvc0_context *, uint32_t,
                          struct nvc0_state_validate *, int, uint32_t *,
                          struct nouveau_bufctx *);
 bool nvc0_state_validate_3d(struct nvc0_context *, uint32_t);
+void nvc0_zcull_forget(struct nvc0_context *, struct pipe_resource *);
+void nvc0_zcull_cleared(struct nvc0_context *, bool whole, int layer);
+void nvc0_zcull_fini(struct nvc0_context *);
 
 /* nvc0_surface.c */
 extern void nvc0_clear(struct pipe_context *, unsigned buffers,

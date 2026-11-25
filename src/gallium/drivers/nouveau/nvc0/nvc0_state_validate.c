@@ -140,6 +140,356 @@ validate_sample_locations(struct nvc0_context *nvc0)
       nvc0_validate_sample_locations(nvc0, ms);
 }
 
+/* ZCULL: coarse depth culling in the GPCs.
+ *
+ * Method names are NVIDIA's (cl9097.h); the order follows NVK's, without
+ * the subregion methods the Fermi class does not have.
+ *
+ * The hardware has eight regions, each a range of the zcull RAM
+ * ("aliquots").  Every depth buffer in use gets its own region, so
+ * switching between depth buffers that fit in the RAM together costs one
+ * method.  When they do not fit, the least recently used region is saved
+ * to its storage buffer (STORE_ZCULL) and its range is given away; it is
+ * loaded back (LOAD_ZCULL) when its depth buffer is bound again.  A region
+ * with nothing valid to load is cleared to "cull nothing".
+ */
+static void
+nvc0_zcull_slot_free(struct nvc0_zcull_slot *slot)
+{
+   nouveau_bo_ref(NULL, &slot->storage);
+   pipe_resource_reference(&slot->res, NULL);
+   memset(slot, 0, sizeof(*slot));
+}
+
+void
+nvc0_zcull_fini(struct nvc0_context *nvc0)
+{
+   int i;
+
+   if (nvc0->zcull.debug)
+      fprintf(stderr, "nvc0 zcull: %u setups, %u stores, %u loads, "
+                      "%u clears, %u forgets\n",
+              nvc0->zcull.stat_setup, nvc0->zcull.stat_store,
+              nvc0->zcull.stat_load, nvc0->zcull.stat_clear,
+              nvc0->zcull.stat_forget);
+
+   for (i = 0; i < NVC0_ZCULL_SLOTS; i++)
+      nvc0_zcull_slot_free(&nvc0->zcull.slot[i]);
+   nvc0->zcull.cur = -1;
+}
+
+/* Depth of res was written by something the region did not see. */
+void
+nvc0_zcull_forget(struct nvc0_context *nvc0, struct pipe_resource *res)
+{
+   int i;
+
+   if (!nvc0->zcull.enable || !res)
+      return;
+
+   for (i = 0; i < NVC0_ZCULL_SLOTS; i++) {
+      struct nvc0_zcull_slot *slot = &nvc0->zcull.slot[i];
+
+      if (slot->res != res)
+         continue;
+      slot->stored = false;
+      slot->stale = true;
+      nvc0->zcull.stat_forget++;
+      if (i == nvc0->zcull.cur)
+         nvc0->dirty_3d |= NVC0_NEW_3D_FRAMEBUFFER;
+   }
+}
+
+/* Clear the active region to the value in CLEAR_DEPTH, or to "far". */
+static void
+nvc0_zcull_clear(struct nvc0_context *nvc0, struct nvc0_zcull_slot *slot,
+                 bool set_far, int layer)
+{
+   struct nouveau_pushbuf *push = nvc0->base.pushbuf;
+   unsigned i;
+
+   if (set_far) {
+      BEGIN_NVC0(push, NVC0_3D(CLEAR_DEPTH), 1);
+      PUSH_DATAf(push, 1.0f);
+   }
+   for (i = 0; i < slot->layers; i++) {
+      if (layer >= 0 && layer != i)
+         continue;
+      BEGIN_NVC0(push, SUBC_3D(0x12c8), 1); /* CLEAR_ZCULL_REGION */
+      /* z, make conservative; one layer of an array */
+      PUSH_DATA (push, 0x00000009 | (slot->layers > 1 ? 0x4 | i << 5 : 0));
+   }
+   nvc0->zcull.stat_clear++;
+}
+
+/* The bound depth buffer was just cleared; CLEAR_DEPTH holds the value. */
+void
+nvc0_zcull_cleared(struct nvc0_context *nvc0, bool whole, int layer)
+{
+   struct nvc0_zcull_slot *slot;
+
+   if (!nvc0->zcull.enable || nvc0->zcull.cur < 0)
+      return;
+   slot = &nvc0->zcull.slot[nvc0->zcull.cur];
+
+   PUSH_SPACE(nvc0->base.pushbuf, 8 + 2 * slot->layers);
+   nvc0_zcull_clear(nvc0, slot, !whole, layer);
+   slot->stored = false;
+   if (layer < 0 || slot->layers == 1)
+      slot->stale = false;
+}
+
+static void
+nvc0_zcull_region(struct nvc0_context *nvc0, struct nvc0_zcull_slot *slot)
+{
+   struct nouveau_pushbuf *push = nvc0->base.pushbuf;
+   const uint64_t addr = slot->storage->offset;
+   const uint64_t limit = addr + slot->storage->size;
+
+   IMMED_NVC0(push, SUBC_3D(0x1590), slot - nvc0->zcull.slot); /* SET_ACTIVE_ZCULL_REGION */
+   BEGIN_NVC0(push, SUBC_3D(0x07e0), 2); /* SET_ZCULL_REGION_LOCATION */
+   PUSH_DATA (push, slot->aliquots << 16 | slot->start);
+   PUSH_DATA (push, slot->aliquots / slot->layers); /* SET_ZCULL_REGION_ALIQUOTS (per layer) */
+   BEGIN_NVC0(push, SUBC_3D(0x07e8), 4); /* SET_ZCULL_STORAGE_A..D */
+   PUSH_DATAh(push, addr);
+   PUSH_DATA (push, addr);
+   PUSH_DATAh(push, limit);
+   PUSH_DATA (push, limit);
+}
+
+/* Save a resident region and give up its range of the RAM. */
+static void
+nvc0_zcull_evict(struct nvc0_context *nvc0, struct nvc0_zcull_slot *slot)
+{
+   struct nouveau_pushbuf *push = nvc0->base.pushbuf;
+
+   if (!slot->stale) {
+      PUSH_SPACE(push, 16);
+      PUSH_REF1 (push, slot->storage, NOUVEAU_BO_VRAM | NOUVEAU_BO_RDWR);
+      nvc0_zcull_region(nvc0, slot);
+      IMMED_NVC0(push, SUBC_3D(0x1464), 0); /* STORE_ZCULL */
+      slot->stored = true;
+      slot->stored_start = slot->start;
+      nvc0->zcull.stat_store++;
+   }
+   slot->resident = false;
+}
+
+/* Find room for the slot's aliquots, evicting older regions as needed. */
+static void
+nvc0_zcull_alloc(struct nvc0_context *nvc0, struct nvc0_zcull_slot *slot)
+{
+   const unsigned total = nvc0->zcull.aliquot_total;
+   struct nvc0_zcull_slot *s, *lru;
+   unsigned start;
+   int i;
+
+   /* Saved data can only be loaded back into the range it came from:
+    * take that range again, evicting whatever sits in it now.
+    */
+   if (slot->stored && !slot->stale) {
+      for (i = 0; i < NVC0_ZCULL_SLOTS; i++) {
+         s = &nvc0->zcull.slot[i];
+         if (s->resident && s != slot &&
+             slot->stored_start < s->start + s->aliquots &&
+             s->start < slot->stored_start + slot->aliquots)
+            nvc0_zcull_evict(nvc0, s);
+      }
+      slot->start = slot->stored_start;
+      slot->resident = true;
+      return;
+   }
+
+   for (;;) {
+      /* first fit: try the start of the RAM and the end of each range */
+      for (i = -1; i < NVC0_ZCULL_SLOTS; i++) {
+         bool fits = true;
+         int j;
+
+         if (i >= 0 && !nvc0->zcull.slot[i].resident)
+            continue;
+         start = i < 0 ? 0 : nvc0->zcull.slot[i].start +
+                             nvc0->zcull.slot[i].aliquots;
+         if (start + slot->aliquots > total)
+            continue;
+         for (j = 0; j < NVC0_ZCULL_SLOTS && fits; j++) {
+            s = &nvc0->zcull.slot[j];
+            if (s->resident && start < s->start + s->aliquots &&
+                s->start < start + slot->aliquots)
+               fits = false;
+         }
+         if (fits) {
+            slot->start = start;
+            slot->resident = true;
+            return;
+         }
+      }
+
+      for (lru = NULL, i = 0; i < NVC0_ZCULL_SLOTS; i++) {
+         s = &nvc0->zcull.slot[i];
+         if (s->resident && s != slot &&
+             (!lru || s->last_use < lru->last_use))
+            lru = s;
+      }
+      assert(lru);
+      if (!lru)
+         return;
+      nvc0_zcull_evict(nvc0, lru);
+   }
+}
+
+static struct nvc0_zcull_slot *
+nvc0_zcull_slot(struct nvc0_context *nvc0, unsigned width, unsigned height,
+                unsigned layers, unsigned aliquots, unsigned zformat)
+{
+   struct pipe_framebuffer_state *fb = &nvc0->framebuffer;
+   struct nouveau_device *dev = nvc0->screen->base.device;
+   struct nvc0_zcull_slot *slot, *lru = NULL;
+   uint32_t size;
+   int i;
+
+   for (i = 0; i < NVC0_ZCULL_SLOTS; i++) {
+      slot = &nvc0->zcull.slot[i];
+      if (slot->res == fb->zsbuf.texture &&
+          slot->level == fb->zsbuf.level &&
+          slot->layer == fb->zsbuf.first_layer &&
+          slot->layers == layers &&
+          slot->width == width && slot->height == height &&
+          slot->zformat == zformat)
+         return slot;
+      if (i != nvc0->zcull.cur &&
+          (!lru || !slot->res ||
+           (lru->res && slot->last_use < lru->last_use)))
+         lru = slot;
+   }
+
+   if (!lru)
+      return NULL;
+   slot = lru;
+   nvc0_zcull_slot_free(slot);
+
+   /* A region is saved at the place of its aliquots in the whole RAM,
+    * not at the start of its storage: size every buffer for all of it.
+    */
+   size = align(nvc0->zcull.aliquot_total * nvc0->zcull.bytes_per_aliquot +
+                nvc0->zcull.header_bytes, 0x1000);
+   if (nouveau_bo_new(dev, NV_VRAM_DOMAIN(&nvc0->screen->base), 0x1000,
+                      size, NULL, &slot->storage))
+      return NULL;
+   /* LOAD_ZCULL from garbage kills the context: start from zeroes. */
+   if (BO_MAP(&nvc0->screen->base, slot->storage, NOUVEAU_BO_WR,
+              nvc0->base.client)) {
+      nouveau_bo_ref(NULL, &slot->storage);
+      return NULL;
+   }
+   memset(slot->storage->map, 0, size);
+
+   pipe_resource_reference(&slot->res, fb->zsbuf.texture);
+   slot->level = fb->zsbuf.level;
+   slot->layer = fb->zsbuf.first_layer;
+   slot->layers = layers;
+   slot->width = width;
+   slot->height = height;
+   slot->aliquots = aliquots;
+   slot->zformat = zformat;
+   return slot;
+}
+
+static void
+nvc0_validate_zcull(struct nvc0_context *nvc0)
+{
+   struct nouveau_pushbuf *push = nvc0->base.pushbuf;
+   struct pipe_framebuffer_state *fb = &nvc0->framebuffer;
+   struct nvc0_zcull_slot *slot = NULL;
+   unsigned width, height, layers, aliquots, zformat = 0;
+   bool usable = false, fresh = false;
+
+   PUSH_SPACE(push, 96);
+
+   if (fb->zsbuf.texture) {
+      switch (fb->zsbuf.format) {
+      case PIPE_FORMAT_Z16_UNORM:
+      case PIPE_FORMAT_Z24X8_UNORM:
+      case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+      case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+      case PIPE_FORMAT_X8Z24_UNORM:
+         zformat = 1; /* FP */
+         usable = true;
+         break;
+      case PIPE_FORMAT_Z32_FLOAT:
+      case PIPE_FORMAT_Z32_FLOAT_S8X24_UINT:
+         zformat = 3; /* ZF32_1 */
+         usable = true;
+         break;
+      default:
+         break;
+      }
+   }
+
+   if (usable) {
+      /* The region is sized in pixels, also for multisampled buffers. */
+      width = align(fb->width, nvc0->zcull.width_align);
+      height = align(fb->height, nvc0->zcull.height_align);
+      layers = fb->zsbuf.last_layer - fb->zsbuf.first_layer + 1;
+      aliquots = DIV_ROUND_UP(width * height,
+                              nvc0->zcull.pixel_squares_by_aliquots) * layers;
+      if (aliquots && aliquots <= nvc0->zcull.aliquot_total)
+         slot = nvc0_zcull_slot(nvc0, width, height, layers, aliquots,
+                                zformat);
+   }
+
+   if (!slot) {
+      IMMED_NVC0(push, SUBC_3D(0x1590), 0x3f); /* SET_ACTIVE_ZCULL_REGION: none */
+      nvc0->zcull.cur = -1;
+      return;
+   }
+
+   slot->last_use = ++nvc0->zcull.tick;
+   if (!slot->resident) {
+      nvc0_zcull_alloc(nvc0, slot);
+      fresh = true;
+   }
+
+   /* The setup is sent with every framebuffer validation: reprogramming
+    * the depth target drops the active region.
+    */
+   BCTX_REFN_bo(nvc0->bufctx_3d, 3D_FB, NOUVEAU_BO_VRAM | NOUVEAU_BO_RDWR,
+                slot->storage);
+   nvc0_zcull_region(nvc0, slot);
+   IMMED_NVC0(push, SUBC_3D(0x15c8), 0); /* SET_ZCULL_REGION_FORMAT: Z_4X4 */
+   BEGIN_NVC0(push, SUBC_3D(0x07c0), 4); /* SET_ZCULL_REGION_SIZE_A..C, PIXEL_OFFSET_C */
+   PUSH_DATA (push, slot->width);
+   PUSH_DATA (push, slot->height);
+   PUSH_DATA (push, slot->layers);
+   PUSH_DATA (push, 0);
+   BEGIN_NVC0(push, SUBC_3D(0x15fc), 2); /* SET_ZCULL_REGION_PIXEL_OFFSET_A, B */
+   PUSH_DATA (push, 0);
+   PUSH_DATA (push, 0);
+   BEGIN_NVC0(push, SUBC_3D(0x0dd8), 1); /* SET_ZCULL_CRITERION: stencil never */
+   PUSH_DATA (push, 0);
+   BEGIN_NVC0(push, SUBC_3D(0x0dbc), 1); /* SET_ZCULL_DIR_FORMAT: LESS */
+   PUSH_DATA (push, slot->zformat << 16);
+   IMMED_NVC0(push, SUBC_3D(0x1968), 1); /* SET_ZCULL: z on, stencil off */
+   nvc0->zcull.stat_setup++;
+
+   if (fresh && slot->stored && !slot->stale &&
+       slot->start == slot->stored_start) {
+      IMMED_NVC0(push, SUBC_3D(0x1500), 0); /* LOAD_ZCULL */
+      nvc0->zcull.stat_load++;
+   } else if (fresh || slot->stale) {
+      nvc0_zcull_clear(nvc0, slot, true, -1);
+   }
+   slot->stored = false;
+   slot->stale = false;
+
+   if (nvc0->zcull.debug && nvc0->zcull.cur != slot - nvc0->zcull.slot)
+      fprintf(stderr, "nvc0 zcull: region %d %ux%ux%u, aliquots %u+%u, "
+                      "zformat %u%s\n", (int)(slot - nvc0->zcull.slot),
+              slot->width, slot->height, slot->layers, slot->start,
+              slot->aliquots, slot->zformat, fresh ? ", fresh" : "");
+   nvc0->zcull.cur = slot - nvc0->zcull.slot;
+}
+
 static void
 nvc0_validate_fb(struct nvc0_context *nvc0)
 {
@@ -265,6 +615,9 @@ nvc0_validate_fb(struct nvc0_context *nvc0)
    BEGIN_NVC0(push, NVC0_3D(RT_CONTROL), 1);
    PUSH_DATA (push, (076543210 << 4) | nr_cbufs);
    IMMED_NVC0(push, NVC0_3D(MULTISAMPLE_MODE), ms_mode);
+
+   if (nvc0->zcull.enable)
+      nvc0_validate_zcull(nvc0);
 
    if (serialize)
       IMMED_NVC0(push, NVC0_3D(SERIALIZE), 0);
