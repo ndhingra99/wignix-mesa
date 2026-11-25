@@ -48,6 +48,9 @@ static void
 nvc0_destroy_query(struct pipe_context *pipe, struct pipe_query *pq)
 {
    struct nvc0_query *q = nvc0_query(pq);
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
+
    q->funcs->destroy_query(nvc0_context(pipe), q);
 }
 
@@ -55,6 +58,9 @@ static bool
 nvc0_begin_query(struct pipe_context *pipe, struct pipe_query *pq)
 {
    struct nvc0_query *q = nvc0_query(pq);
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
+
    return q->funcs->begin_query(nvc0_context(pipe), q);
 }
 
@@ -62,6 +68,9 @@ static bool
 nvc0_end_query(struct pipe_context *pipe, struct pipe_query *pq)
 {
    struct nvc0_query *q = nvc0_query(pq);
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
+
    q->funcs->end_query(nvc0_context(pipe), q);
    return true;
 }
@@ -71,6 +80,9 @@ nvc0_get_query_result(struct pipe_context *pipe, struct pipe_query *pq,
                       bool wait, union pipe_query_result *result)
 {
    struct nvc0_query *q = nvc0_query(pq);
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
+
    return q->funcs->get_query_result(nvc0_context(pipe), q, wait, result);
 }
 
@@ -84,6 +96,9 @@ nvc0_get_query_result_resource(struct pipe_context *pipe,
                                unsigned offset)
 {
    struct nvc0_query *q = nvc0_query(pq);
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
+
    if (!q->funcs->get_query_result_resource) {
       assert(!"Unexpected lack of get_query_result_resource");
       return;
@@ -105,6 +120,8 @@ nvc0_render_condition(struct pipe_context *pipe,
    bool wait =
       mode != PIPE_RENDER_COND_NO_WAIT &&
       mode != PIPE_RENDER_COND_BY_REGION_NO_WAIT;
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
 
    if (!pq) {
       cond = NVC0_3D_COND_MODE_ALWAYS;

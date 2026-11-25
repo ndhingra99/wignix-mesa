@@ -360,6 +360,44 @@ nouveau_buffer_should_discard(struct nv04_resource *buf, unsigned usage)
    return buf->mm && nouveau_buffer_busy(buf, PIPE_MAP_WRITE);
 }
 
+/* A buffer created as dynamic starts in video memory, where the GPU reads it
+ * fastest but every write mapping goes through a staging copy of the whole
+ * mapped range.  Once the application streams into it (it asks for an
+ * unsynchronized mapping, or replaces content it has already filled in), the
+ * buffer is better off in system memory, where mapping costs nothing.  This
+ * is only done when the mapping leaves no old content to carry over.
+ */
+static inline bool
+nouveau_buffer_should_stream(struct nouveau_screen *screen,
+                             struct nv04_resource *buf, unsigned usage,
+                             const struct pipe_box *box)
+{
+   if (buf->domain != NOUVEAU_BO_VRAM ||
+       buf->base.usage != PIPE_USAGE_DYNAMIC ||
+       !(usage & PIPE_MAP_WRITE) ||
+       (usage & PIPE_MAP_READ))
+      return false;
+   if (!(usage & (PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_DISCARD_WHOLE_RESOURCE)))
+      return false;
+   if (buf->base.bind & PIPE_BIND_SHARED)
+      return false;
+   if (buf->base.bind &&
+       !(buf->base.bind & screen->vidmem_bindings & screen->sysmem_bindings))
+      return false;
+
+   const bool empty =
+      buf->valid_buffer_range.start >= buf->valid_buffer_range.end;
+
+   /* the first fill of a buffer says nothing about how it will be used */
+   if (usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE)
+      return !empty || (usage & PIPE_MAP_UNSYNCHRONIZED);
+   if (!(usage & PIPE_MAP_DISCARD_RANGE))
+      return false;
+   return empty ||
+          (box->x <= buf->valid_buffer_range.start &&
+           box->x + box->width >= buf->valid_buffer_range.end);
+}
+
 /* Returns a pointer to a memory area representing a window into the
  * resource's data.
  *
@@ -409,6 +447,23 @@ nouveau_buffer_transfer_map(struct pipe_context *pipe,
       NOUVEAU_DRV_STAT(nv->screen, buf_transfers_rd, 1);
    if (usage & PIPE_MAP_WRITE)
       NOUVEAU_DRV_STAT(nv->screen, buf_transfers_wr, 1);
+
+   if (nouveau_buffer_should_stream(nv->screen, buf, usage, box)) {
+      int ref = buf->base.reference.count - 1;
+
+      if (!nouveau_buffer_reallocate(nv->screen, buf, NOUVEAU_BO_GART) &&
+          !nouveau_buffer_allocate(nv->screen, buf, NOUVEAU_BO_VRAM)) {
+         FREE(tx);
+         return NULL;
+      }
+      /* the old content is gone, and with it the copy kept of it */
+      if (buf->data) {
+         align_free(buf->data);
+         buf->data = NULL;
+      }
+      if (ref > 0) /* any references inside context possible ? */
+         nv->invalidate_resource_storage(nv, &buf->base, ref);
+   }
 
    /* If we are trying to write to an uninitialized range, the user shouldn't
     * care what was there before. So we can treat the write as if the target

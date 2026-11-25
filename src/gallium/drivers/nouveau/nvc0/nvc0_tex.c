@@ -791,6 +791,8 @@ nve4_create_texture_handle(struct pipe_context *pipe,
                            struct pipe_sampler_view *view,
                            const struct pipe_sampler_state *sampler)
 {
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
+
    /* We have to create persistent handles that won't change for these objects
     * That means that we have to upload them into place and lock them so that
     * they can't be kicked out later.
@@ -1351,6 +1353,8 @@ nve4_create_image_handle(struct pipe_context *pipe,
    struct nvc0_screen *screen = nvc0->screen;
    int i = screen->img.next, s;
 
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
+
    while (screen->img.entries[i]) {
       i = (i + 1) & (NVE4_IMG_MAX_HANDLES - 1);
       if (i == screen->img.next)
@@ -1420,6 +1424,8 @@ static uint64_t
 gm107_create_image_handle(struct pipe_context *pipe,
                           const struct pipe_image_view *view)
 {
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
+
    /* GM107+ use TIC handles to reference images. As such, image handles are
     * just the TIC id.
     */

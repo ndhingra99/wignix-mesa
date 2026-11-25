@@ -27,6 +27,8 @@ nvc0_m2mf_transfer_rect(struct nvc0_context *nvc0,
    uint32_t dy = dst->y;
    uint32_t exec = (1 << 20);
 
+   NVC0_STREAM_SCOPE(nvc0);
+
    assert(dst->cpp == src->cpp);
 
    nouveau_bufctx_refn(bctx, 0, src->bo, src->domain | NOUVEAU_BO_RD);
@@ -132,6 +134,8 @@ nve4_m2mf_transfer_rect(struct nvc0_context *nvc0,
    uint32_t src_base = src->base;
    uint32_t dst_base = dst->base;
 
+   NVC0_STREAM_SCOPE(nvc0);
+
    assert(dst->cpp < ARRAY_SIZE(cpbs) && cpbs[dst->cpp].cs);
    assert(dst->cpp == src->cpp);
 
@@ -205,6 +209,8 @@ nvc0_m2mf_push_linear(struct nouveau_context *nv,
    uint32_t *src = (uint32_t *)data;
    unsigned count = (size + 3) / 4;
 
+   NVC0_STREAM_SCOPE(nvc0_context(&nv->pipe));
+
    nouveau_bufctx_refn(nvc0->bufctx, 0, dst, domain | NOUVEAU_BO_WR);
    nouveau_pushbuf_bufctx(push, nvc0->bufctx);
    PUSH_VAL(push);
@@ -247,6 +253,8 @@ nve4_p2mf_push_linear(struct nouveau_context *nv,
    uint32_t *src = (uint32_t *)data;
    unsigned count = (size + 3) / 4;
 
+   NVC0_STREAM_SCOPE(nvc0_context(&nv->pipe));
+
    nouveau_bufctx_refn(nvc0->bufctx, 0, dst, domain | NOUVEAU_BO_WR);
    nouveau_pushbuf_bufctx(push, nvc0->bufctx);
    PUSH_VAL(push);
@@ -286,6 +294,8 @@ nvc0_m2mf_copy_linear(struct nouveau_context *nv,
    struct nouveau_pushbuf *push = nv->pushbuf;
    struct nouveau_bufctx *bctx = nvc0_context(&nv->pipe)->bufctx;
 
+   NVC0_STREAM_SCOPE(nvc0_context(&nv->pipe));
+
    nouveau_bufctx_refn(bctx, 0, src, srcdom | NOUVEAU_BO_RD);
    nouveau_bufctx_refn(bctx, 0, dst, dstdom | NOUVEAU_BO_WR);
    nouveau_pushbuf_bufctx(push, bctx);
@@ -323,6 +333,8 @@ nve4_m2mf_copy_linear(struct nouveau_context *nv,
 {
    struct nouveau_pushbuf *push = nv->pushbuf;
    struct nouveau_bufctx *bctx = nvc0_context(&nv->pipe)->bufctx;
+
+   NVC0_STREAM_SCOPE(nvc0_context(&nv->pipe));
 
    nouveau_bufctx_refn(bctx, 0, src, srcdom | NOUVEAU_BO_RD);
    nouveau_bufctx_refn(bctx, 0, dst, dstdom | NOUVEAU_BO_WR);
@@ -579,6 +591,8 @@ nvc0_cb_bo_push(struct nouveau_context *nv,
                 unsigned offset, unsigned words, const uint32_t *data)
 {
    struct nouveau_pushbuf *push = nv->pushbuf;
+
+   NVC0_STREAM_SCOPE(nvc0_context(&nv->pipe));
 
    NOUVEAU_DRV_STAT(nv->screen, constbuf_upload_count, 1);
    NOUVEAU_DRV_STAT(nv->screen, constbuf_upload_bytes, words * 4);

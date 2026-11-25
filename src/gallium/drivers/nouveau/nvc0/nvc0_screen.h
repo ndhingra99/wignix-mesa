@@ -69,7 +69,15 @@ struct nvc0_screen {
 
    struct nvc0_context *cur_ctx;
    struct nvc0_graph_state save_state;
+   /* The channel and its hardware state are shared by all contexts of the
+    * screen.  A context holds state_lock while it writes commands to its
+    * pushbuf or submits it.  stream_ctx is the context whose commands are
+    * not submitted yet; another context submits them before it writes its
+    * own (nvc0_stream_begin), so the channel sees whole runs of one context.
+    */
    simple_mtx_t state_lock;
+   struct nvc0_context *stream_ctx;
+   unsigned kick_draws; /* submit after this many draws, 0 = only when asked */
 
    int num_occlusion_queries_active;
 

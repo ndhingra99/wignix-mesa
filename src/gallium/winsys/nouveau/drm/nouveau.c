@@ -1079,6 +1079,10 @@ struct nouveau_pushbuf_priv {
    uint32_t *bgn;
    int bo_next;
    int bo_nr;
+   /* submitted by nouveau_pushbuf_kick_detached: the buffer contexts on
+    * bctx_list still list their buffers as referenced by the submission
+    */
+   bool bctx_stale;
    struct nouveau_bo *bos[];
 };
 
@@ -1224,8 +1228,22 @@ pushbuf_submit(struct nouveau_pushbuf *push, struct nouveau_object *chan)
    return ret;
 }
 
+/* The buffers of every buffer context used since the last submission have
+ * to be referenced again by the next one.
+ */
+static void
+pushbuf_bctx_requeue(struct nouveau_pushbuf_priv *nvpb)
+{
+   list_for_each_entry_safe(struct nouveau_bufctx, bctx, &nvpb->bctx_list, head) {
+      list_splice(&bctx->current, &bctx->pending);
+      list_inithead(&bctx->current);
+      list_delinit(&bctx->head);
+   }
+   nvpb->bctx_stale = false;
+}
+
 static int
-pushbuf_flush(struct nouveau_pushbuf *push)
+pushbuf_flush_krec(struct nouveau_pushbuf *push)
 {
    struct nouveau_pushbuf_priv *nvpb = nouveau_pushbuf(push);
    struct nouveau_pushbuf_krec *krec = nvpb->krec;
@@ -1250,12 +1268,15 @@ pushbuf_flush(struct nouveau_pushbuf *push)
    krec->nr_reloc = 0;
    krec->nr_push = 0;
 
-   list_for_each_entry_safe(struct nouveau_bufctx, bctx, &nvpb->bctx_list, head) {
-      list_splice(&bctx->current, &bctx->pending);
-      list_inithead(&bctx->current);
-      list_delinit(&bctx->head);
-   }
+   return ret;
+}
 
+static int
+pushbuf_flush(struct nouveau_pushbuf *push)
+{
+   int ret = pushbuf_flush_krec(push);
+
+   pushbuf_bctx_requeue(nouveau_pushbuf(push));
    return ret;
 }
 
@@ -1504,6 +1525,9 @@ pushbuf_validate(struct nouveau_pushbuf *push, bool retry)
    int relocs = bctx ? bctx->relocs * 2: 0;
    int sref, srel, ret;
 
+   if (nvpb->bctx_stale)
+      pushbuf_bctx_requeue(nvpb);
+
    ret = nouveau_pushbuf_space(push, relocs, relocs, 0);
    if (ret || bctx == NULL)
       return ret;
@@ -1695,6 +1719,22 @@ nouveau_pushbuf_kick(struct nouveau_pushbuf *push)
 {
    pushbuf_flush(push);
    return pushbuf_validate(push, false);
+}
+
+/* Submit a pushbuf from a thread other than the one that fills it, which
+ * may be editing its buffer contexts at this moment.  They are left alone
+ * here and requeued when the pushbuf is next validated or submitted by its
+ * own thread.  The caller makes sure that thread is not writing commands.
+ */
+int
+nouveau_pushbuf_kick_detached(struct nouveau_pushbuf *push)
+{
+   int ret = pushbuf_flush_krec(push);
+
+   nouveau_pushbuf(push)->bctx_stale = true;
+   if (ret)
+      return ret;
+   return nouveau_pushbuf_space(push, 0, 0, 0);
 }
 
 int

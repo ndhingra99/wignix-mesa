@@ -205,6 +205,7 @@ nouveau_pushbuf_bufctx(struct nouveau_pushbuf *, struct nouveau_bufctx *);
 void nouveau_pushbuf_data(struct nouveau_pushbuf *, struct nouveau_bo *, uint64_t offset,
                           uint64_t length);
 int nouveau_pushbuf_kick(struct nouveau_pushbuf *);
+int nouveau_pushbuf_kick_detached(struct nouveau_pushbuf *);
 int nouveau_pushbuf_refn(struct nouveau_pushbuf *, struct nouveau_pushbuf_refn *, int nr);
 void nouveau_pushbuf_reloc(struct nouveau_pushbuf *, struct nouveau_bo *, uint32_t data,
                            uint32_t flags, uint32_t vor, uint32_t tor);

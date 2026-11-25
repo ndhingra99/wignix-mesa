@@ -184,6 +184,9 @@ struct nvc0_context {
 
    struct nvc0_screen *screen;
 
+   unsigned stream_depth;  /* nesting of nvc0_stream_lock on this context */
+   unsigned draws_pending; /* draws written since the last submit */
+
    void (*m2mf_copy_rect)(struct nvc0_context *,
                           const struct nv50_m2mf_rect *dst,
                           const struct nv50_m2mf_rect *src,
@@ -325,6 +328,73 @@ nvc0_context(struct pipe_context *pipe)
    return (struct nvc0_context *)pipe;
 }
 
+MUST_CHECK bool nvc0_default_kick_notify(struct nouveau_context *);
+MUST_CHECK bool nvc0_draw_vbo_kick_notify(struct nouveau_context *);
+
+/* Take the screen's command stream for this context without claiming the
+ * hardware: enough for submitting the context's own pushbuf.
+ */
+static inline void
+nvc0_stream_lock(struct nvc0_context *nvc0)
+{
+   if (!nvc0->stream_depth++)
+      simple_mtx_lock(&nvc0->screen->state_lock);
+}
+
+static inline void
+nvc0_stream_unlock(struct nvc0_context *nvc0)
+{
+   assert(nvc0->stream_depth);
+   if (!--nvc0->stream_depth)
+      simple_mtx_unlock(&nvc0->screen->state_lock);
+}
+
+/* Bracket for everything that writes commands.  The first context to write
+ * after another one submits what that one left pending.
+ */
+static inline void
+nvc0_stream_begin(struct nvc0_context *nvc0)
+{
+   struct nvc0_screen *screen = nvc0->screen;
+
+   nvc0_stream_lock(nvc0);
+   if (unlikely(screen->stream_ctx != nvc0)) {
+      struct nvc0_context *prev = screen->stream_ctx;
+
+      if (prev) {
+         prev->base.kick_notify = nvc0_draw_vbo_kick_notify;
+         PUSH_KICK_DETACHED(prev->base.pushbuf);
+         prev->base.kick_notify = nvc0_default_kick_notify;
+      }
+      screen->stream_ctx = nvc0;
+   }
+}
+
+static inline void
+nvc0_stream_end(struct nvc0_context *nvc0)
+{
+   nvc0_stream_unlock(nvc0);
+}
+
+static inline void
+nvc0_stream_scope_end(struct nvc0_context **nvc0)
+{
+   nvc0_stream_end(*nvc0);
+}
+
+static inline struct nvc0_context *
+nvc0_stream_scope_begin(struct nvc0_context *nvc0)
+{
+   nvc0_stream_begin(nvc0);
+   return nvc0;
+}
+
+/* nvc0_stream_begin now, nvc0_stream_end when the enclosing block is left */
+#define NVC0_STREAM_SCOPE(nvc0) \
+   struct nvc0_context *stream_scope_ \
+      __attribute__((cleanup(nvc0_stream_scope_end), unused)) = \
+      nvc0_stream_scope_begin(nvc0)
+
 static inline unsigned
 nvc0_shader_stage(unsigned pipe)
 {
@@ -369,7 +439,6 @@ nvc0_resource_validate(struct nvc0_context *nvc0, struct nv04_resource *res, uin
 struct pipe_context *nvc0_create(struct pipe_screen *, void *, unsigned flags);
 void nvc0_bufctx_fence(struct nvc0_context *, struct nouveau_bufctx *,
                        bool on_flush);
-MUST_CHECK bool nvc0_default_kick_notify(struct nouveau_context *);
 const void *nvc0_get_sample_locations(unsigned);
 
 /* nvc0_draw.c */

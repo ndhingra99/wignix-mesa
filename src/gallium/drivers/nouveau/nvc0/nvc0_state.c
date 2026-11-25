@@ -627,9 +627,9 @@ nvc0_sp_state_delete(struct pipe_context *pipe, void *hwcso)
    struct nvc0_context *nvc0 = nvc0_context(pipe);
    struct nvc0_program *prog = (struct nvc0_program *)hwcso;
 
-   simple_mtx_lock(&nvc0->screen->state_lock);
+   nvc0_stream_lock(nvc0);
    nvc0_program_destroy(nvc0_context(pipe), prog);
-   simple_mtx_unlock(&nvc0->screen->state_lock);
+   nvc0_stream_unlock(nvc0);
 
    ralloc_free(prog->nir);
    FREE(prog);
@@ -1103,6 +1103,8 @@ nvc0_so_target_save_offset(struct pipe_context *pipe,
                            unsigned index, bool *serialize)
 {
    struct nvc0_so_target *targ = nvc0_so_target(ptarg);
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
 
    if (*serialize) {
       *serialize = false;

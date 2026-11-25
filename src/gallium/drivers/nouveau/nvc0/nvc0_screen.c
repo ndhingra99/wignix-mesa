@@ -801,6 +801,7 @@ nvc0_screen_create(struct nouveau_device *dev)
    pscreen->destroy = nvc0_screen_destroy;
 
    simple_mtx_init(&screen->state_lock, mtx_plain);
+   screen->kick_draws = debug_get_num_option("NVC0_KICK_DRAWS", 128);
 
    ret = nouveau_screen_init(&screen->base, dev);
    if (ret)

@@ -562,9 +562,13 @@ nvc0_prim_gl(unsigned prim)
    }
 }
 
-static bool
+/* Submit without closing the context's current fence: the buffers of the
+ * commands going out stay tied to it until a later submit emits it.
+ */
+bool
 nvc0_draw_vbo_kick_notify(struct nouveau_context *context)
 {
+   nvc0_context(&context->pipe)->draws_pending = 0;
    _nouveau_fence_update(context->screen, true);
    return true;
 }
@@ -874,8 +878,11 @@ nvc0_draw_indirect(struct nvc0_context *nvc0, const struct pipe_draw_info *info,
 
       PUSH_SPACE_EX(push, 16, 0, pushes + !!buf_count);
       PUSH_REF1(push, buf->bo, NOUVEAU_BO_RD | buf->domain);
-      if (buf_count)
+      nvc0_resource_validate(nvc0, buf, NOUVEAU_BO_RD);
+      if (buf_count) {
          PUSH_REF1(push, buf_count->bo, NOUVEAU_BO_RD | buf_count->domain);
+         nvc0_resource_validate(nvc0, buf_count, NOUVEAU_BO_RD);
+      }
       PUSH_DATA(push,
                 NVC0_FIFO_PKHDR_1I(0, macro, 3 + !!buf_count + draws * size));
       PUSH_DATA(push, nvc0_prim_gl(info->mode));
@@ -1068,8 +1075,7 @@ nvc0_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
 
    unsigned drawid = drawid_offset;
 
-   /* dont wanna start trippin */
-   simple_mtx_lock(&nvc0->screen->state_lock);
+   nvc0_stream_begin(nvc0);
 
    /* NOTE: caller must ensure that (min_index + index_bias) is >= 0 */
    if (info->index_bounds_valid) {
@@ -1143,6 +1149,8 @@ nvc0_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       }
 
       BCTX_REFN(nvc0->bufctx_3d, 3D_IDX, buf, RD);
+      /* state validation only fences buffers when some state is dirty */
+      nvc0_resource_validate(nvc0, buf, NOUVEAU_BO_RD);
    }
 
    list_for_each_entry(struct nvc0_resident, resident, &nvc0->tex_head, list) {
@@ -1167,8 +1175,8 @@ nvc0_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          drawid++;
    }
 
-   PUSH_KICK(push);
-   simple_mtx_unlock(&nvc0->screen->state_lock);
+   if (screen->kick_draws && ++nvc0->draws_pending >= screen->kick_draws)
+      PUSH_KICK(push);
 
    nvc0->base.kick_notify = nvc0_default_kick_notify;
 
@@ -1179,4 +1187,6 @@ nvc0_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_3D_TEXT);
    nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_3D_IDX);
    nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_3D_BINDLESS);
+
+   nvc0_stream_end(nvc0);
 }

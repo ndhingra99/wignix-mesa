@@ -86,7 +86,9 @@ nvc0_flush(struct pipe_context *pipe,
       nouveau_fence_ref(nvc0->base.fence, (struct nouveau_fence **)fence,
                         nvc0->base.screen);
 
+   nvc0_stream_lock(nvc0);
    PUSH_KICK(nvc0->base.pushbuf); /* fencing handled in kick_notify */
+   nvc0_stream_unlock(nvc0);
 
    nouveau_context_update_frame_stats(&nvc0->base);
 }
@@ -95,6 +97,8 @@ static void
 nvc0_texture_barrier(struct pipe_context *pipe, unsigned flags)
 {
    struct nouveau_pushbuf *push = nvc0_context(pipe)->base.pushbuf;
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
 
    IMMED_NVC0(push, NVC0_3D(SERIALIZE), 0);
    IMMED_NVC0(push, NVC0_3D(TEX_CACHE_CTL), 0);
@@ -106,6 +110,8 @@ nvc0_memory_barrier(struct pipe_context *pipe, unsigned flags)
    struct nvc0_context *nvc0 = nvc0_context(pipe);
    struct nouveau_pushbuf *push = nvc0->base.pushbuf;
    int i, s;
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
 
    if (!(flags & ~PIPE_BARRIER_UPDATE))
       return;
@@ -163,6 +169,8 @@ nvc0_emit_string_marker(struct pipe_context *pipe, const char *str, int len)
    struct nouveau_pushbuf *push = nvc0_context(pipe)->base.pushbuf;
    int string_words = len / 4;
    int data_words;
+
+   NVC0_STREAM_SCOPE(nvc0_context(pipe));
 
    if (len <= 0)
       return;
@@ -240,13 +248,12 @@ nvc0_destroy(struct pipe_context *pipe)
 {
    struct nvc0_context *nvc0 = nvc0_context(pipe);
 
-   simple_mtx_lock(&nvc0->screen->state_lock);
+   nvc0_stream_lock(nvc0);
    if (nvc0->screen->cur_ctx == nvc0) {
       nvc0->screen->cur_ctx = NULL;
       nvc0->screen->save_state = nvc0->state;
       nvc0->screen->save_state.tfb = NULL;
    }
-   simple_mtx_unlock(&nvc0->screen->state_lock);
 
    if (nvc0->base.pipe.stream_uploader)
       u_upload_destroy(nvc0->base.pipe.stream_uploader);
@@ -272,6 +279,11 @@ nvc0_destroy(struct pipe_context *pipe)
    }
 
    nouveau_fence_cleanup(&nvc0->base);
+
+   if (nvc0->screen->stream_ctx == nvc0)
+      nvc0->screen->stream_ctx = NULL;
+   nvc0_stream_unlock(nvc0);
+
    nouveau_context_destroy(&nvc0->base);
 }
 
@@ -284,6 +296,7 @@ nvc0_default_kick_notify(struct nouveau_context *context)
       return false;
    _nouveau_fence_update(context->screen, true);
 
+   nvc0->draws_pending = 0;
    nvc0->state.flushed = true;
    return true;
 }
