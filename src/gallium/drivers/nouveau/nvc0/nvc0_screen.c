@@ -828,7 +828,7 @@ nvc0_screen_create(struct nouveau_device *dev)
 
    simple_mtx_init(&screen->state_lock, mtx_plain);
    screen->kick_draws = debug_get_num_option("NVC0_KICK_DRAWS", 128);
-   screen->threaded = debug_get_bool_option("NVC0_THREADED", false);
+   screen->threaded = debug_get_bool_option("NVC0_THREADED", true);
    screen->base.threaded_buffers = screen->threaded;
    slab_create_parent(&screen->transfer_pool, sizeof(struct threaded_transfer), 16);
 

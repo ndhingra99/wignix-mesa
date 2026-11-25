@@ -518,7 +518,7 @@ nvc0_create(struct pipe_screen *pscreen, void *priv, unsigned ctxflags)
     * registers of a Quadro 2000M: 4 TPCs, 4 zcull banks, 2048 aliquots.
     */
    if (screen->base.device->chipset == 0xc3 &&
-       debug_get_bool_option("NVC0_ZCULL", false)) {
+       debug_get_bool_option("NVC0_ZCULL", true)) {
       nvc0->zcull.enable = true;
       nvc0->zcull.debug = debug_get_bool_option("NVC0_ZCULL_DEBUG", false);
       nvc0->zcull.aliquot_total = 2048;
