@@ -16,6 +16,7 @@
 #include "vk_format.h"
 
 #include "nvtypes.h"
+#include "cla097.h"
 #include "nv_push_cl902d.h"
 #include "nv_push_cl90b5.h"
 #include "nv_push_cla040.h"
@@ -186,11 +187,264 @@ nil_to_nvcab5_gob_type(enum nil_gob_type gob_type)
 #undef NVCAB5_GOB_KIND
 }
 
+/* Fermi: the same rectangle copy through the M2MF class, the way the GL
+ * driver does it (nvc0_m2mf_transfer_rect).  M2MF copies bytes; it cannot
+ * rearrange components.
+ */
+static void
+nouveau_copy_rect_m2mf(struct nvk_cmd_buffer *cmd,
+                       const struct nouveau_copy *copy)
+{
+   assert(copy->src.bpp == copy->dst.bpp);
+   const uint32_t cpp = copy->src.bpp;
+   const bool src_linear = copy->src.tiling.gob_type == NIL_GOB_TYPE_LINEAR;
+   const bool dst_linear = copy->dst.tiling.gob_type == NIL_GOB_TYPE_LINEAR;
+
+   assert(copy->extent_el.depth == 1 || copy->extent_el.array_len == 1);
+   uint32_t layers = MAX2(copy->extent_el.depth, copy->extent_el.array_len);
+   for (unsigned z = 0; z < layers; z++) {
+      VkDeviceSize src_addr = copy->src.base_addr;
+      VkDeviceSize dst_addr = copy->dst.base_addr;
+
+      if (copy->src.image_type != VK_IMAGE_TYPE_3D)
+         src_addr += (z + copy->src.offset_el.a) * copy->src.array_stride;
+      if (copy->dst.image_type != VK_IMAGE_TYPE_3D)
+         dst_addr += (z + copy->dst.offset_el.a) * copy->dst.array_stride;
+
+      /* EXEC: bit 20 is what nvc0 always sets; 4 and 8 say linear */
+      uint32_t exec = 1 << 20;
+
+      struct nv_push *p = nvk_cmd_buffer_push(cmd, 12);
+
+      if (src_linear) {
+         src_addr += copy->src.offset_el.x * cpp +
+                     copy->src.offset_el.y * copy->src.row_stride;
+         __push_mthd(p, SUBC_NV9039, 0x0314); /* PITCH_IN */
+         P_INLINE_DATA(p, copy->src.row_stride);
+         exec |= 0x10;
+      } else {
+         __push_mthd(p, SUBC_NV9039, 0x0204); /* TILING_MODE_IN .. Z */
+         P_INLINE_DATA(p, copy->src.tiling.x_log2 |
+                          (copy->src.tiling.y_log2 << 4) |
+                          (copy->src.tiling.z_log2 << 8));
+         P_INLINE_DATA(p, copy->src.row_stride);
+         P_INLINE_DATA(p, copy->src.extent_el.height);
+         P_INLINE_DATA(p, copy->src.extent_el.depth);
+         P_INLINE_DATA(p, copy->src.image_type == VK_IMAGE_TYPE_3D ?
+                          z + copy->src.offset_el.z : 0);
+      }
+
+      if (dst_linear) {
+         dst_addr += copy->dst.offset_el.x * cpp +
+                     copy->dst.offset_el.y * copy->dst.row_stride;
+         __push_mthd(p, SUBC_NV9039, 0x0318); /* PITCH_OUT */
+         P_INLINE_DATA(p, copy->dst.row_stride);
+         exec |= 0x100;
+      } else {
+         __push_mthd(p, SUBC_NV9039, 0x0220); /* TILING_MODE_OUT .. Z */
+         P_INLINE_DATA(p, copy->dst.tiling.x_log2 |
+                          (copy->dst.tiling.y_log2 << 4) |
+                          (copy->dst.tiling.z_log2 << 8));
+         P_INLINE_DATA(p, copy->dst.row_stride);
+         P_INLINE_DATA(p, copy->dst.extent_el.height);
+         P_INLINE_DATA(p, copy->dst.extent_el.depth);
+         P_INLINE_DATA(p, copy->dst.image_type == VK_IMAGE_TYPE_3D ?
+                          z + copy->dst.offset_el.z : 0);
+      }
+
+      /* at most 2047 lines per launch */
+      uint32_t sy = copy->src.offset_el.y, dy = copy->dst.offset_el.y;
+      for (uint32_t left = copy->extent_el.height; left > 0;) {
+         const uint32_t lines = MIN2(left, 2047);
+
+         p = nvk_cmd_buffer_push(cmd, 17);
+
+         __push_mthd(p, SUBC_NV9039, 0x030c); /* OFFSET_IN_HIGH, LOW */
+         P_INLINE_DATA(p, src_addr >> 32);
+         P_INLINE_DATA(p, src_addr & 0xffffffff);
+         __push_mthd(p, SUBC_NV9039, 0x0238); /* OFFSET_OUT_HIGH, LOW */
+         P_INLINE_DATA(p, dst_addr >> 32);
+         P_INLINE_DATA(p, dst_addr & 0xffffffff);
+
+         if (src_linear) {
+            src_addr += lines * copy->src.row_stride;
+         } else {
+            __push_mthd(p, SUBC_NV9039, 0x0344); /* TILING_POSITION_IN_X, Y */
+            P_INLINE_DATA(p, copy->src.offset_el.x * cpp);
+            P_INLINE_DATA(p, sy);
+         }
+         if (dst_linear) {
+            dst_addr += lines * copy->dst.row_stride;
+         } else {
+            __push_mthd(p, SUBC_NV9039, 0x034c); /* TILING_POSITION_OUT_X, Y */
+            P_INLINE_DATA(p, copy->dst.offset_el.x * cpp);
+            P_INLINE_DATA(p, dy);
+         }
+
+         __push_mthd(p, SUBC_NV9039, 0x031c); /* LINE_LENGTH_IN, LINE_COUNT */
+         P_INLINE_DATA(p, copy->extent_el.width * cpp);
+         P_INLINE_DATA(p, lines);
+         __push_mthd(p, SUBC_NV9039, 0x0300); /* EXEC */
+         P_INLINE_DATA(p, exec);
+
+         left -= lines;
+         sy += lines;
+         dy += lines;
+      }
+   }
+}
+
+/* Fermi: a rectangle copy that rearranges components, through the copy
+ * engine.  On Fermi that engine runs nouveau's own firmware, whose methods
+ * are not the ones of the published 90b5 class
+ * (drivers/gpu/drm/nouveau/nvkm/engine/ce/fuc/com.fuc in the kernel):
+ *
+ *    0x0200..0x0218  source tiling: mode, width, height, depth, z, x, y
+ *    0x0220..0x0238  the same for the destination
+ *    0x0300          EXEC: 0x1 use FORMAT, 0x10 / 0x100 linear source /
+ *                    destination
+ *    0x030c..0x0334  source address high, low; destination address high,
+ *                    low; source pitch; destination pitch; pixels per line;
+ *                    lines; FORMAT; constant 0; constant 1
+ *
+ * FORMAT: a nibble per destination component (0..3 a source component, 4 and
+ * 5 the constants, 6 as in the 90b5 class), bytes per component - 1 in bits
+ * 16..17, source components - 1 in 20..21, destination components - 1 in
+ * 24..25.  With FORMAT, widths and x positions count pixels.
+ */
+static void
+nouveau_copy_rect_fermi_ce(struct nvk_cmd_buffer *cmd,
+                           const struct nouveau_copy *copy)
+{
+   const bool src_linear = copy->src.tiling.gob_type == NIL_GOB_TYPE_LINEAR;
+   const bool dst_linear = copy->dst.tiling.gob_type == NIL_GOB_TYPE_LINEAR;
+   const uint32_t num_src_comps = copy->src.bpp / copy->remap.comp_size;
+   const uint32_t num_dst_comps = copy->dst.bpp / copy->remap.comp_size;
+   const uint32_t format = copy->remap.dst[0] |
+                           (copy->remap.dst[1] << 4) |
+                           (copy->remap.dst[2] << 8) |
+                           (copy->remap.dst[3] << 12) |
+                           ((copy->remap.comp_size - 1) << 16) |
+                           ((num_src_comps - 1) << 20) |
+                           ((num_dst_comps - 1) << 24);
+   const uint32_t exec = 0x1 | (src_linear ? 0x10 : 0) |
+                               (dst_linear ? 0x100 : 0);
+
+   assert(copy->extent_el.depth == 1 || copy->extent_el.array_len == 1);
+   uint32_t layers = MAX2(copy->extent_el.depth, copy->extent_el.array_len);
+   for (unsigned z = 0; z < layers; z++) {
+      VkDeviceSize src_addr = copy->src.base_addr;
+      VkDeviceSize dst_addr = copy->dst.base_addr;
+
+      if (copy->src.image_type != VK_IMAGE_TYPE_3D)
+         src_addr += (z + copy->src.offset_el.a) * copy->src.array_stride;
+      if (copy->dst.image_type != VK_IMAGE_TYPE_3D)
+         dst_addr += (z + copy->dst.offset_el.a) * copy->dst.array_stride;
+
+      if (src_linear) {
+         src_addr += copy->src.offset_el.x * copy->src.bpp +
+                     copy->src.offset_el.y * copy->src.row_stride;
+      }
+      if (dst_linear) {
+         dst_addr += copy->dst.offset_el.x * copy->dst.bpp +
+                     copy->dst.offset_el.y * copy->dst.row_stride;
+      }
+
+      /* at most 8191 lines per launch */
+      uint32_t sy = copy->src.offset_el.y, dy = copy->dst.offset_el.y;
+      for (uint32_t left = copy->extent_el.height; left > 0;) {
+         const uint32_t lines = MIN2(left, 8191);
+
+         struct nv_push *p = nvk_cmd_buffer_push(cmd, 30);
+
+         if (!src_linear) {
+            __push_mthd(p, SUBC_NV90B5, 0x0200);
+            P_INLINE_DATA(p, copy->src.tiling.x_log2 |
+                             (copy->src.tiling.y_log2 << 4) |
+                             (copy->src.tiling.z_log2 << 8));
+            P_INLINE_DATA(p, copy->src.row_stride / copy->src.bpp);
+            P_INLINE_DATA(p, copy->src.extent_el.height);
+            P_INLINE_DATA(p, copy->src.extent_el.depth);
+            P_INLINE_DATA(p, copy->src.image_type == VK_IMAGE_TYPE_3D ?
+                             z + copy->src.offset_el.z : 0);
+            P_INLINE_DATA(p, copy->src.offset_el.x);
+            P_INLINE_DATA(p, sy);
+         }
+         if (!dst_linear) {
+            __push_mthd(p, SUBC_NV90B5, 0x0220);
+            P_INLINE_DATA(p, copy->dst.tiling.x_log2 |
+                             (copy->dst.tiling.y_log2 << 4) |
+                             (copy->dst.tiling.z_log2 << 8));
+            P_INLINE_DATA(p, copy->dst.row_stride / copy->dst.bpp);
+            P_INLINE_DATA(p, copy->dst.extent_el.height);
+            P_INLINE_DATA(p, copy->dst.extent_el.depth);
+            P_INLINE_DATA(p, copy->dst.image_type == VK_IMAGE_TYPE_3D ?
+                             z + copy->dst.offset_el.z : 0);
+            P_INLINE_DATA(p, copy->dst.offset_el.x);
+            P_INLINE_DATA(p, dy);
+         }
+
+         __push_mthd(p, SUBC_NV90B5, 0x030c);
+         P_INLINE_DATA(p, src_addr >> 32);
+         P_INLINE_DATA(p, src_addr & 0xffffffff);
+         P_INLINE_DATA(p, dst_addr >> 32);
+         P_INLINE_DATA(p, dst_addr & 0xffffffff);
+         P_INLINE_DATA(p, copy->src.row_stride);
+         P_INLINE_DATA(p, copy->dst.row_stride);
+         P_INLINE_DATA(p, copy->extent_el.width);
+         P_INLINE_DATA(p, lines);
+         P_INLINE_DATA(p, format);
+         P_INLINE_DATA(p, 0);
+         P_INLINE_DATA(p, 0);
+         __push_mthd(p, SUBC_NV90B5, 0x0300);
+         P_INLINE_DATA(p, exec);
+
+         if (src_linear)
+            src_addr += lines * copy->src.row_stride;
+         if (dst_linear)
+            dst_addr += lines * copy->dst.row_stride;
+         left -= lines;
+         sy += lines;
+         dy += lines;
+      }
+   }
+}
+
 static void
 nouveau_copy_rect(struct nvk_cmd_buffer *cmd,
                   struct nouveau_copy *copy,
                   uint8_t data_transfer_type)
 {
+   const struct nvk_physical_device *pdev =
+      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+   if (pdev->info.cls_eng3d < KEPLER_A) {
+      /* M2MF copies bytes as they are; only a copy that really rearranges
+       * components needs the copy engine.
+       */
+      bool same_bytes =
+         copy->src.bpp == copy->dst.bpp &&
+         (copy->remap.comp_size == 0 ||
+          (copy->remap.dst[0] == 0 && copy->remap.dst[1] == 1 &&
+           copy->remap.dst[2] == 2 && copy->remap.dst[3] == 3));
+
+      /* The depth of a Z24S8 image going to a buffer: the buffer's fourth
+       * byte is undefined by the API, so the stencil may come along.
+       */
+      if (copy->src.bpp == 4 && copy->dst.bpp == 4 &&
+          copy->remap.comp_size == 1 &&
+          copy->dst.tiling.gob_type == NIL_GOB_TYPE_LINEAR &&
+          copy->remap.dst[0] == 0 && copy->remap.dst[1] == 1 &&
+          copy->remap.dst[2] == 2 &&
+          copy->remap.dst[3] == NV90B5_SET_REMAP_COMPONENTS_DST_W_NO_WRITE)
+         same_bytes = true;
+
+      if (same_bytes)
+         nouveau_copy_rect_m2mf(cmd, copy);
+      else
+         nouveau_copy_rect_fermi_ce(cmd, copy);
+      return;
+   }
+
    uint32_t src_bw, dst_bw;
    if (copy->remap.comp_size > 0) {
       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
@@ -370,6 +624,35 @@ nouveau_copy_rect(struct nvk_cmd_buffer *cmd,
    }
 }
 
+/* Bytes from one address to another through M2MF, as the GL driver does
+ * (nvc0_m2mf_copy_linear).
+ */
+void
+nvk_cmd_m2mf_copy_linear(struct nvk_cmd_buffer *cmd, uint64_t dst_addr,
+                         uint64_t src_addr, uint64_t size)
+{
+   while (size) {
+      const uint32_t bytes = MIN2(size, 1 << 17);
+      struct nv_push *p = nvk_cmd_buffer_push(cmd, 11);
+
+      __push_mthd(p, SUBC_NV9039, 0x0238); /* OFFSET_OUT_HIGH, LOW */
+      P_INLINE_DATA(p, dst_addr >> 32);
+      P_INLINE_DATA(p, dst_addr & 0xffffffff);
+      __push_mthd(p, SUBC_NV9039, 0x030c); /* OFFSET_IN_HIGH, LOW */
+      P_INLINE_DATA(p, src_addr >> 32);
+      P_INLINE_DATA(p, src_addr & 0xffffffff);
+      __push_mthd(p, SUBC_NV9039, 0x031c); /* LINE_LENGTH_IN, LINE_COUNT */
+      P_INLINE_DATA(p, bytes);
+      P_INLINE_DATA(p, 1);
+      __push_mthd(p, SUBC_NV9039, 0x0300); /* EXEC: linear in and out */
+      P_INLINE_DATA(p, (1 << 20) | 0x10 | 0x100);
+
+      src_addr += bytes;
+      dst_addr += bytes;
+      size -= bytes;
+   }
+}
+
 void
 nvk_cmd_copy_buffer_ce(struct nvk_cmd_buffer *cmd,
                        const VkCopyBufferInfo2 *pCopyBufferInfo)
@@ -383,6 +666,11 @@ nvk_cmd_copy_buffer_ce(struct nvk_cmd_buffer *cmd,
       uint64_t src_addr = vk_buffer_address(&src->vk, region->srcOffset);
       uint64_t dst_addr = vk_buffer_address(&dst->vk, region->dstOffset);
       uint64_t size = region->size;
+
+      if (nvk_cmd_buffer_is_fermi(cmd)) {
+         nvk_cmd_m2mf_copy_linear(cmd, dst_addr, src_addr, size);
+         continue;
+      }
 
       while (size) {
          struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
@@ -897,6 +1185,39 @@ nvk_cmd_fill_memory_ce(struct nvk_cmd_buffer *cmd,
 {
    uint32_t max_dim = 1 << 15;
 
+   if (nvk_cmd_buffer_is_fermi(cmd)) {
+      /* nouveau's copy firmware: FORMAT with one four-byte component taken
+       * from constant 0 (nibble 4), no source component, lines of up to
+       * 4096 words.
+       */
+      max_dim = 4096;
+      while (size >= 4) {
+         const uint32_t width = MIN2(size / 4, max_dim);
+         const uint32_t height =
+            width == max_dim ? MIN2(size / (max_dim * 4), max_dim) : 1;
+         struct nv_push *p = nvk_cmd_buffer_push(cmd, 14);
+
+         __push_mthd(p, SUBC_NV90B5, 0x030c);
+         P_INLINE_DATA(p, dst_addr >> 32);
+         P_INLINE_DATA(p, dst_addr & 0xffffffff);
+         P_INLINE_DATA(p, dst_addr >> 32);
+         P_INLINE_DATA(p, dst_addr & 0xffffffff);
+         P_INLINE_DATA(p, width * 4);
+         P_INLINE_DATA(p, width * 4);
+         P_INLINE_DATA(p, width);
+         P_INLINE_DATA(p, height);
+         P_INLINE_DATA(p, 0x4 | (3 << 16));
+         P_INLINE_DATA(p, data);
+         P_INLINE_DATA(p, 0);
+         __push_mthd(p, SUBC_NV90B5, 0x0300);
+         P_INLINE_DATA(p, 0x1 | 0x10 | 0x100);
+
+         dst_addr += (uint64_t)width * height * 4;
+         size -= (uint64_t)width * height * 4;
+      }
+      return;
+   }
+
    struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
 
    P_IMMD(p, NV90B5, SET_REMAP_CONST_A, data);
@@ -965,6 +1286,16 @@ nvk_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
 
    uint64_t dst_addr = vk_buffer_address(&dst->vk, dstOffset);
    uint8_t subc = nvk_cmd_buffer_last_subchannel(cmd);
+
+   if (nvk_cmd_buffer_is_fermi(cmd)) {
+      /* no inline-to-memory on the Fermi 3D class: stage the data and
+       * copy it with M2MF
+       */
+      uint64_t data_addr;
+      nvk_cmd_buffer_upload_data(cmd, pData, dataSize, 64, &data_addr);
+      nvk_cmd_m2mf_copy_linear(cmd, dst_addr, data_addr, dataSize);
+      return;
+   }
 
    /* From the Vulkan 1.4.354 spec:
     *

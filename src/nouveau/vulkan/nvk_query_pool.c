@@ -409,6 +409,13 @@ nvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
 
    uint64_t report_addr = nvk_query_report_addr(pool, query);
    uint8_t subc = nvk_cmd_buffer_last_subchannel(cmd);
+   /* Fermi: nouveau's copy-engine firmware has no semaphore release of its
+    * own (only one after a copy), and M2MF and 2D have none; the 3D engine
+    * writes it.
+    */
+   if (nvk_device_physical(nvk_cmd_buffer_device(cmd))->info.cls_eng3d < 0xa097 &&
+       subc != SUBC_NV9097 && subc != SUBC_NV90C0)
+      subc = SUBC_NV9097;
    if (subc == SUBC_NV9097) {
       struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
       P_IMMD(p, NV9097, FLUSH_PENDING_WRITES, 0);

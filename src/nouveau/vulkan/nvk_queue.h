@@ -6,6 +6,7 @@
 #define NVK_QUEUE_H 1
 
 #include "nvk_mem_stream.h"
+#include "nv_device_info.h"
 #include "nv_push.h"
 
 #include "vk_queue.h"
@@ -60,7 +61,8 @@ nvk_queue_device(struct nvk_queue *queue)
 }
 
 static inline enum nvkmd_engines
-nvk_queue_engines_from_queue_flags(VkQueueFlags queue_flags)
+nvk_queue_engines_from_queue_flags(const struct nv_device_info *info,
+                                   VkQueueFlags queue_flags)
 {
    enum nvkmd_engines engines = 0;
    if (queue_flags & VK_QUEUE_GRAPHICS_BIT) {
@@ -73,8 +75,14 @@ nvk_queue_engines_from_queue_flags(VkQueueFlags queue_flags)
       /* We currently rely on 3D engine MMEs for indirect dispatch */
       engines |= NVKMD_ENGINE_3D;
    }
-   if (queue_flags & VK_QUEUE_TRANSFER_BIT)
+   if (queue_flags & VK_QUEUE_TRANSFER_BIT) {
       engines |= NVKMD_ENGINE_COPY;
+      /* Before Kepler (3D class a097) copies go through M2MF and the 2D
+       * engine.
+       */
+      if (info->cls_eng3d < 0xa097)
+         engines |= NVKMD_ENGINE_M2MF | NVKMD_ENGINE_2D;
+   }
 
    return engines;
 }

@@ -52,6 +52,9 @@ struct nvk_device {
 
    struct nvk_layer_dispatch_tables layer_dispatch;
    struct nvkmd_mem *zero_page;
+
+   /* Fermi: where the compute root table lives (nvk_cmd_dispatch_fermi) */
+   struct nvkmd_mem *fermi_cs_root;
    struct nvk_descriptor_table images;
    struct nvk_descriptor_table samplers;
    struct nvk_edb_bview_cache edb_bview_cache;

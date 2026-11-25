@@ -2,6 +2,7 @@
  * Copyright © 2022 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include "cla0c0.h"
 #include "nvk_buffer.h"
 #include "nvk_cmd_buffer.h"
 #include "nvk_descriptor_set.h"
@@ -335,6 +336,15 @@ nvk_meta_image_copy_gfx_supported(struct nvk_image *img)
 static bool
 nvk_meta_image_copy_compute_supported(struct nvk_image *img)
 {
+   /* Fermi copies with M2MF and the copy engine.  With the compute shaders
+    * of these copies vkcube still loses its channel in about one start out
+    * of three (a shader read at address 0).
+    */
+   struct nvk_device *dev =
+      container_of(img->vk.base.device, struct nvk_device, vk);
+   if (nvk_device_physical(dev)->info.cls_compute < KEPLER_COMPUTE_A)
+      return false;
+
    if (vk_format_is_depth_or_stencil(img->vk.format))
       return false;
    if (vk_format_is_compressed(img->vk.format))
@@ -533,7 +543,9 @@ nvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
 
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
-   if (queue_flags & VK_QUEUE_COMPUTE_BIT) {
+   if (nvk_cmd_buffer_is_fermi(cmd)) {
+      nvk_cmd_copy_buffer_ce(cmd, pCopyBufferInfo);
+   } else if (queue_flags & VK_QUEUE_COMPUTE_BIT) {
       nvk_cmd_copy_buffer_meta(cmd, pCopyBufferInfo);
    } else {
       nvk_cmd_copy_buffer_ce(cmd, pCopyBufferInfo);
@@ -565,7 +577,7 @@ nvk_CmdFillBuffer(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
 
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
-   if (queue_flags & VK_QUEUE_COMPUTE_BIT) {
+   if ((queue_flags & VK_QUEUE_COMPUTE_BIT) && !nvk_cmd_buffer_is_fermi(cmd)) {
       nvk_cmd_fill_buffer_meta(cmd, dstBuffer, dstOffset, size, data);
    } else {
       VK_FROM_HANDLE(nvk_buffer, dst_buffer, dstBuffer);

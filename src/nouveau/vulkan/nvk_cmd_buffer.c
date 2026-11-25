@@ -23,6 +23,8 @@
 #include "clb097.h"
 #include "clb197.h"
 #include "clcb97.h"
+#include "nv_push_cl902d.h"
+#include "nv_push_cl9039.h"
 #include "nv_push_cl906f.h"
 #include "nv_push_cla16f.h"
 #include "nv_push_cl9097.h"
@@ -154,7 +156,8 @@ nvk_cmd_buffer_subchannel_mask(struct nvk_cmd_buffer *cmd)
 {
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
    enum nvkmd_engines engines =
-      nvk_queue_engines_from_queue_flags(queue_flags);
+      nvk_queue_engines_from_queue_flags(
+         &nvk_device_physical(nvk_cmd_buffer_device(cmd))->info, queue_flags);
    return nvk_queue_subchannels_from_engines(engines);
 }
 
@@ -287,6 +290,13 @@ nvk_cmd_buffer_upload_alloc(struct nvk_cmd_buffer *cmd,
    }
 
    return VK_SUCCESS;
+}
+
+bool
+nvk_cmd_buffer_is_fermi(struct nvk_cmd_buffer *cmd)
+{
+   return nvk_device_physical(nvk_cmd_buffer_device(cmd))->info.cls_eng3d <
+          KEPLER_A;
 }
 
 VkResult
@@ -559,7 +569,8 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
    enum nvkmd_engines engines =
-      nvk_queue_engines_from_queue_flags(queue_flags);
+      nvk_queue_engines_from_queue_flags(
+         &nvk_device_physical(nvk_cmd_buffer_device(cmd))->info, queue_flags);
 
    enum nvk_barrier barriers = 0;
 
@@ -640,10 +651,55 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
          P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
          break;
       }
+      case SUBC_NV9039: {
+         struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+         P_IMMD(p, NV9039, WAIT_FOR_IDLE, 0);
+         break;
+      }
+      case SUBC_NV902D: {
+         struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+         P_IMMD(p, NV902D, WAIT_FOR_IDLE, 0);
+         break;
+      }
       default:
          assert(!"Unknown subc");
          FALLTHROUGH;
       case SUBC_NV90B5: {
+         const struct nvk_physical_device *pdev =
+            nvk_device_physical(nvk_cmd_buffer_device(cmd));
+         if (pdev->info.cls_eng3d < KEPLER_A) {
+            /* nouveau's Fermi copy firmware has its own method layout and
+             * would run the launch below as a copy with whatever state is
+             * left over.  It has no method that waits, but every launch
+             * first waits for the copy before it: a four-byte copy inside
+             * a scratch area holds the channel until the real copies are
+             * done.  Method 0x304 then flushes the write cache.
+             */
+            uint64_t scratch_addr;
+            void *scratch_map;
+            if (nvk_cmd_buffer_upload_alloc(cmd, 64, 64, &scratch_addr,
+                                            &scratch_map) != VK_SUCCESS)
+               break;
+
+            struct nv_push *p = nvk_cmd_buffer_push(cmd, 16);
+            __push_mthd(p, SUBC_NV90B5, 0x030c);
+            P_INLINE_DATA(p, scratch_addr >> 32);
+            P_INLINE_DATA(p, scratch_addr & 0xffffffff);
+            P_INLINE_DATA(p, (scratch_addr + 32) >> 32);
+            P_INLINE_DATA(p, (scratch_addr + 32) & 0xffffffff);
+            P_INLINE_DATA(p, 4);
+            P_INLINE_DATA(p, 4);
+            P_INLINE_DATA(p, 4);
+            P_INLINE_DATA(p, 1);
+            P_INLINE_DATA(p, 0); /* FORMAT: one byte, component 0 */
+            P_INLINE_DATA(p, 0);
+            P_INLINE_DATA(p, 0);
+            __push_mthd(p, SUBC_NV90B5, 0x0300);
+            P_INLINE_DATA(p, 0x1 | 0x10 | 0x100);
+            __push_mthd(p, SUBC_NV90B5, 0x0304);
+            P_INLINE_DATA(p, 0);
+            break;
+         }
          struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
          P_MTHD(p, NV90B5, LINE_LENGTH_IN);
          P_NV90B5_LINE_LENGTH_IN(p, 0);
@@ -729,7 +785,8 @@ nvk_cmd_invalidate_deps(struct nvk_cmd_buffer *cmd,
 
    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
    enum nvkmd_engines engines =
-      nvk_queue_engines_from_queue_flags(queue_flags);
+      nvk_queue_engines_from_queue_flags(
+         &nvk_device_physical(nvk_cmd_buffer_device(cmd))->info, queue_flags);
 
    if (!(engines & (NVKMD_ENGINE_3D | NVKMD_ENGINE_COMPUTE)))
       barriers &= ~(NVK_BARRIER_INVALIDATE_TEX_DATA |
@@ -781,7 +838,10 @@ nvk_cmd_invalidate_deps(struct nvk_cmd_buffer *cmd,
 
    if (barriers & (NVK_BARRIER_INVALIDATE_SHADER_DATA |
                    NVK_BARRIER_INVALIDATE_CONSTANT)) {
-      if (nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NVA097) {
+      if (pdev->info.cls_eng3d < KEPLER_A &&
+          nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NV9097) {
+         /* not a method of the Fermi 3D class */
+      } else if (nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NVA097) {
          P_IMMD(p, NVA097, INVALIDATE_SHADER_CACHES_NO_WFI, {
             .global_data = (barriers & NVK_BARRIER_INVALIDATE_SHADER_DATA) != 0,
             .constant = (barriers & NVK_BARRIER_INVALIDATE_CONSTANT) != 0,

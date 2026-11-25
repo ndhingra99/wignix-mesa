@@ -363,6 +363,45 @@ lookup_ycbcr_conversion(const void *_state, uint32_t set,
           &sampler->vk.ycbcr_conversion->state : NULL;
 }
 
+/* Fermi compute shaders use no constant buffers.  The compute class's
+ * constant buffer binds take the place of the 3D class's on this hardware,
+ * and 3D shaders then read the compute root table for their own
+ * (tests/vkdawn.c Z9, notes 2026-11-24); a dispatch that binds none leaves
+ * the 3D class alone.  The compute root table has a fixed address
+ * (nvk_device::fermi_cs_root) and is read from memory.
+ */
+static bool
+nvk_is_fermi_cs(const struct nvk_physical_device *pdev, const nir_shader *nir)
+{
+   return nir->info.stage == MESA_SHADER_COMPUTE &&
+          pdev->info.cls_eng3d < KEPLER_A;
+}
+
+static bool
+lower_fermi_cs_root_load(nir_builder *b, nir_intrinsic_instr *load, void *data)
+{
+   const struct nvk_device *dev = data;
+
+   if (load->intrinsic != nir_intrinsic_ldc_nv)
+      return false;
+
+   /* the root table is the only constant buffer such a shader has */
+   assert(nir_src_is_const(load->src[0]) && nir_src_as_uint(load->src[0]) == 0);
+
+   b->cursor = nir_before_instr(&load->instr);
+
+   const uint64_t base = dev->fermi_cs_root->va->addr +
+                         nir_intrinsic_base(load);
+   nir_def *addr = nir_iadd(b, nir_imm_int64(b, base),
+                               nir_u2u64(b, load->src[1].ssa));
+   nir_def *val = nir_load_global_constant(b, load->def.num_components,
+                                           load->def.bit_size, addr,
+                                           .align_mul = 4);
+   nir_def_replace(&load->def, val);
+
+   return true;
+}
+
 static void
 nvk_lower_nir(struct nvk_device *dev, nir_shader *nir,
               VkShaderCreateFlagsEXT shader_flags,
@@ -398,7 +437,14 @@ nvk_lower_nir(struct nvk_device *dev, nir_shader *nir,
             nir_address_format_32bit_offset);
 
    struct nvk_cbuf_map *cbuf_map = NULL;
-   if (!(pdev->debug_flags & NVK_DEBUG_NO_CBUF)) {
+   if (nvk_is_fermi_cs(pdev, nir)) {
+      /* The map still carries the texture and sampler units; it gets the
+       * root table only (nvk_nir_lower_descriptors), which
+       * lower_fermi_cs_root_load takes out again.  No large constants: they
+       * would need a constant buffer.
+       */
+      cbuf_map = cbuf_map_out;
+   } else if (!(pdev->debug_flags & NVK_DEBUG_NO_CBUF)) {
       cbuf_map = cbuf_map_out;
 
       /* Large constant support assumes cbufs */
@@ -466,6 +512,14 @@ nvk_lower_nir(struct nvk_device *dev, nir_shader *nir,
             nvk_ubo_addr_format(pdev, rs));
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             lower_load_intrinsic, nir_metadata_none, pdev);
+
+   if (nvk_is_fermi_cs(pdev, nir)) {
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fermi_cs_root_load,
+               nir_metadata_control_flow, dev);
+      assert(cbuf_map_out->cbuf_count == 1 &&
+             cbuf_map_out->cbufs[0].type == NVK_CBUF_TYPE_ROOT_DESC);
+      cbuf_map_out->cbuf_count = 0;
+   }
 
    if (mesa_shader_stage_uses_workgroup(nir->info.stage)) {
       nir_variable_mode var_modes = nir_var_mem_shared;
@@ -643,7 +697,11 @@ nvk_shader_get_shader_size(struct nvk_device *dev, struct nvk_shader *shader,
 
    if (out_code_offset) {
       *out_code_offset = total_size;
-      assert(*out_code_offset % alignment == 0);
+      /* From Kepler on it is the first instruction that has to be aligned;
+       * on Fermi it is the start of the header, which the upload aligns.
+       */
+      assert(pdev->info.cls_eng3d < KEPLER_A ||
+             *out_code_offset % alignment == 0);
    }
 
    total_size += shader->code_size;

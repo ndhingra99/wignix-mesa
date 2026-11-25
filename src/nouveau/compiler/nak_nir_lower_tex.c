@@ -21,6 +21,47 @@ has_cbuf_tex(const struct nak_compiler *nak) {
    return nak->sm >= 70 && nak->sm < 100;
 }
 
+/* Before Kepler a texture instruction names the units its texture and its
+ * sampler are bound to.  The driver passes them as a "handle": texture unit
+ * in bits 0..7, sampler unit in bits 8..11.  A constant handle goes into the
+ * instruction; a computed one (an array of textures indexed at run time)
+ * uses the indirect form, see fermi_indirect_units().
+ */
+static bool
+has_bound_tex(const struct nak_compiler *nak) {
+   return nak->sm < 30;
+}
+
+/* Fermi's indirect form (TexRef::Bindless on SM20): the first source
+ * register carries the texture unit in bits 23..31, the sampler unit in
+ * bits 16..22 and the array index below (0xttxsaaaa, the GL compiler's
+ * handleTEX and handleTXQ).
+ */
+static nir_def *
+fermi_indirect_units(nir_builder *b, nir_def *h, nir_def *arr_idx,
+                     bool with_sampler)
+{
+   nir_def *units = nir_ishl_imm(b, nir_iand_imm(b, h, 0xff), 23);
+   if (with_sampler) {
+      nir_def *samp = nir_iand_imm(b, nir_ushr_imm(b, h, 8), 0x7f);
+      units = nir_ior(b, units, nir_ishl_imm(b, samp, 16));
+   }
+   if (arr_idx != NULL)
+      units = nir_ior(b, units, arr_idx);
+   return units;
+}
+
+static bool
+tex_handle_as_bound(nir_def *tex_h, uint32_t *index_out)
+{
+   nir_scalar s = { .def = tex_h, .comp = 0 };
+   if (tex_h == NULL || !nir_scalar_is_const(s))
+      return false;
+
+   *index_out = nir_scalar_as_uint(s);
+   return true;
+}
+
 static bool
 tex_handle_as_cbuf(nir_def *tex_h, uint32_t *cbuf_out)
 {
@@ -48,7 +89,14 @@ build_txq(nir_builder *b, nir_texop op, nir_def *img_h, nir_def *lod_idx,
 {
    uint32_t texture_index = 0;
    enum nak_nir_tex_ref_type ref_type = NAK_NIR_TEX_REF_TYPE_BINDLESS;
-   if (has_cbuf_tex(nak) && tex_handle_as_cbuf(img_h, &texture_index)) {
+   if (has_bound_tex(nak)) {
+      if (tex_handle_as_bound(img_h, &texture_index)) {
+         ref_type = NAK_NIR_TEX_REF_TYPE_BOUND;
+         img_h = NULL;
+      } else {
+         img_h = fermi_indirect_units(b, img_h, NULL, false);
+      }
+   } else if (has_cbuf_tex(nak) && tex_handle_as_cbuf(img_h, &texture_index)) {
       ref_type = NAK_NIR_TEX_REF_TYPE_CBUF;
       img_h = NULL;
    }
@@ -221,8 +269,20 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
                          nir_iand_imm(b, samp_h, 0xfff00000));
    }
 
+   /* what the instruction refers to, for the queries built further down */
+   nir_def *tex_ref_h = tex_h;
+
    enum nak_nir_tex_ref_type ref_type = NAK_NIR_TEX_REF_TYPE_BINDLESS;
-   if (has_cbuf_tex(nak) && tex_handle_as_cbuf(tex_h, &tex->texture_index)) {
+   if (has_bound_tex(nak)) {
+      /* a computed handle stays in tex_h and is packed with the array index
+       * below
+       */
+      if (tex_handle_as_bound(tex_h, &tex->texture_index)) {
+         ref_type = NAK_NIR_TEX_REF_TYPE_BOUND;
+         tex_h = NULL;
+      }
+   } else if (has_cbuf_tex(nak) &&
+              tex_handle_as_cbuf(tex_h, &tex->texture_index)) {
       ref_type = NAK_NIR_TEX_REF_TYPE_CBUF;
       tex_h = NULL;
    }
@@ -384,7 +444,63 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
          nir_tex_instr_add_src(tex, nir_tex_src_backend2,
                                nir_vec(b, src1, src1_comps));
       }
-   } else if (nak->sm >= 30) {
+   } else if (nak->sm >= 20 && nak->sm < 30) {
+      /* Fermi: the first operand holds the handle or array index and the
+       * coordinates and nothing else; sample, LOD or bias, offsets and the
+       * depth reference follow each other in the second operand (the GL
+       * compiler's texConstraintNVC0 and handleTEX).  The offset of a
+       * derivative lookup is the exception: it follows the coordinates.
+       */
+      nir_def *src0[4] = { NULL, };
+      nir_def *src1[4] = { NULL, };
+      unsigned src0_comps = 0, src1_comps = 0;
+
+      if (tex_h != NULL)
+         PUSH(src0, fermi_indirect_units(b, tex_h, arr_idx, true));
+      else if (arr_idx != NULL)
+         PUSH(src0, arr_idx);
+
+      for (uint32_t i = 0; i < coord_components; i++)
+         PUSH(src0, nir_channel(b, coord, i));
+
+      if (tex->op == nir_texop_txd) {
+         if (offset != NULL)
+            PUSH(src0, offset);
+
+         assert(ddx->num_components == coord_components);
+         for (uint32_t i = 0; i < coord_components; i++) {
+            PUSH(src1, nir_channel(b, ddx, i));
+            PUSH(src1, nir_channel(b, ddy, i));
+         }
+      } else {
+         if (ms_idx != NULL)
+            PUSH(src1, ms_idx);
+         if (lod != NULL)
+            PUSH(src1, lod);
+         if (offset_mode == NAK_NIR_OFFSET_MODE_AOFFI) {
+            PUSH(src1, offset);
+         } else if (offset_mode == NAK_NIR_OFFSET_MODE_PER_PX) {
+            PUSH(src1, nir_channel(b, offset, 0));
+            PUSH(src1, nir_channel(b, offset, 1));
+         }
+         if (z_cmpr != NULL)
+            PUSH(src1, z_cmpr);
+      }
+
+      /* Both sources are vec4s */
+      while (src0_comps % 4)
+         PUSH(src0, nir_undef(b, 1, 32));
+      nir_tex_instr_add_src(tex, nir_tex_src_backend1, nir_vec(b, src0, 4));
+      if (src1_comps > 0) {
+         while (src1_comps % 4)
+            PUSH(src1, nir_undef(b, 1, 32));
+         nir_tex_instr_add_src(tex, nir_tex_src_backend2,
+                               nir_vec(b, src1, 4));
+      }
+   } else if (nak->sm >= 20) {
+      /* Kepler takes the handle, array index, coordinates, sample, LOD,
+       * offsets and depth reference in this order, four to an operand.
+       */
       nir_def *src[8] = { NULL, };
       unsigned src_comps = 0;
 
@@ -481,7 +597,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct nak_compiler *nak)
 
       if (!has_null_descriptors(nak)) {
          nir_def *img_is_null =
-            build_img_is_null(b, tex_h, tex->can_speculate, nak);
+            build_img_is_null(b, tex_ref_h, tex->can_speculate, nak);
          res = nir_bcsel(b, img_is_null, nir_imm_int(b, 0), res);
       }
 

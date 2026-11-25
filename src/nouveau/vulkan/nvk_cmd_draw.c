@@ -656,6 +656,18 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
       P_NV9097_SET_VAB_MEMORY_AREA_C(p, SIZE_BYTES_256K);
    }
 
+   if (pdev->info.cls_eng3d < KEPLER_A) {
+      /* Bound units per stage: 16 samplers and 32 texture headers, as in
+       * the compute init (nvk_push_dispatch_state_init).
+       */
+      for (uint32_t s = 0; s < 5; s++) {
+         P_IMMD(p, NV9097, SET_BINDING_CONTROL_TEXTURE(s), {
+            .max_active_samplers = MAX_ACTIVE_SAMPLERS__16,
+            .max_active_headers = MAX_ACTIVE_HEADERS__32,
+         });
+      }
+   }
+
    if (pdev->info.cls_eng3d == MAXWELL_A)
       P_IMMD(p, NVB097, SET_SELECT_MAXWELL_TEXTURE_HEADERS, V_TRUE);
 
@@ -795,9 +807,12 @@ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
          .lines = LINES_ALL,
       });
 
-      P_IMMD(p, NVA097, INVALIDATE_SHADER_CACHES_NO_WFI, {
-         .constant = CONSTANT_TRUE,
-      });
+      /* not a method of the Fermi 3D class */
+      if (nvk_device_physical(dev)->info.cls_eng3d >= KEPLER_A) {
+         P_IMMD(p, NVA097, INVALIDATE_SHADER_CACHES_NO_WFI, {
+            .constant = CONSTANT_TRUE,
+         });
+      }
       if (dev->vk.enabled_extensions.EXT_discard_rectangles) {
          P_IMMD(p, NV9097,
                 SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_WINDOW_CLIP_ENABLED),
@@ -808,6 +823,7 @@ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
    }
 
    cmd->state.gfx.descriptors.flush_root = nvk_cmd_flush_gfx_root_desc;
+   cmd->state.gfx.fermi_rebind = true;
 
    if (cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
        (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)) {
@@ -4390,13 +4406,102 @@ nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd)
    }
 }
 
+/* Before Kepler: bind the texture and sampler units the bound shaders use,
+ * from the descriptor sets.
+ */
+static void
+nvk_cmd_flush_gfx_tex_units(struct nvk_cmd_buffer *cmd)
+{
+   struct nvk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+
+   for (mesa_shader_stage stage = 0; stage < MESA_SHADER_MESH_STAGES; stage++) {
+      const struct nvk_shader *shader = cmd->state.gfx.shaders[stage];
+      if (shader == NULL)
+         continue;
+
+      const struct nvk_cbuf_map *map = &shader->cbuf_map;
+      if (map->tex_unit_count == 0 && map->sampler_unit_count == 0)
+         continue;
+
+      const uint32_t group = nvk_cbuf_binding_for_stage(stage, false);
+      struct nv_push *p =
+         nvk_cmd_buffer_push(cmd, 2 * (map->tex_unit_count +
+                                       map->sampler_unit_count));
+
+      for (uint32_t i = 0; i < map->tex_unit_count; i++) {
+         const struct nvk_sampled_image_descriptor *d =
+            nvk_cmd_buffer_get_tex_unit_desc(desc, &map->tex_units[i]);
+
+         P_IMMD(p, NV9097, BIND_GROUP_TEXTURE_HEADER(group), {
+            .valid = d != NULL,
+            .texture_slot = i,
+            .index = d != NULL ? d->image_index : 0,
+         });
+      }
+
+      for (uint32_t i = 0; i < map->sampler_unit_count; i++) {
+         const struct nvk_tex_unit *unit = &map->sampler_units[i];
+         const struct nvk_sampled_image_descriptor *d =
+            nvk_cmd_buffer_get_tex_unit_desc(desc, unit);
+
+         P_IMMD(p, NV9097, BIND_GROUP_TEXTURE_SAMPLER(group), {
+            .valid = d != NULL || unit->type == NVK_TEX_UNIT_TYPE_TXF_SAMPLER,
+            .sampler_slot = i,
+            .index = d != NULL ? d->sampler_index : 0,
+         });
+      }
+   }
+}
+
 static void
 nvk_cmd_flush_gfx_state(struct nvk_cmd_buffer *cmd)
 {
+   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+
    nvk_cmd_buffer_flush_push_descriptors(cmd, &cmd->state.gfx.descriptors);
    nvk_cmd_flush_gfx_dynamic_state(cmd);
    nvk_cmd_flush_gfx_shaders(cmd);
+
+   /* On Fermi the compute class's constant buffer, texture and sampler
+    * binds replace the 3D ones (the GL driver calls them aliased), and the
+    * 3D class runs with MODE_METHOD_TRACK_WITH_FILTER, which drops a method
+    * whose value is the one it shadows.  A 3D bind that repeats the last 3D
+    * value is therefore lost and the shaders go on reading what compute
+    * bound (tests/vkdawn.c Z9: push constants read from the compute root
+    * table).  So the first draw of a command buffer and the first draw
+    * after a dispatch bind everything with the filter off.
+    */
+   const bool fermi_rebind = pdev->info.cls_eng3d < KEPLER_A &&
+                             cmd->state.gfx.fermi_rebind;
+   if (fermi_rebind) {
+      for (uint32_t g = 0; g < ARRAY_SIZE(cmd->state.gfx.cbuf_groups); g++) {
+         struct nvk_cbuf_group *group = &cmd->state.gfx.cbuf_groups[g];
+         group->dirty |= BITFIELD_MASK(ARRAY_SIZE(group->cbufs));
+      }
+
+      struct nv_push *p = nvk_cmd_buffer_push(cmd, 14);
+      P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_TRACK);
+      P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SELECT_CB0));
+      P_INLINE_DATA(p, 0);
+      for (uint32_t group = 0; group < 5; group++) {
+         P_IMMD(p, NV9097, BIND_GROUP_CONSTANT_BUFFER(group), {
+            .valid = VALID_TRUE,
+            .shader_slot = 0,
+         });
+      }
+   }
+
    nvk_cmd_flush_gfx_cbufs(cmd);
+   if (pdev->info.cls_eng3d < KEPLER_A)
+      nvk_cmd_flush_gfx_tex_units(cmd);
+
+   if (fermi_rebind) {
+      struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+      P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL,
+             MODE_METHOD_TRACK_WITH_FILTER);
+      cmd->state.gfx.fermi_rebind = false;
+   }
 
    if (NAK_CAN_PRINTF)
       nvk_cmd_buffer_flush_printf_buffer(cmd, &cmd->state.gfx.descriptors);
@@ -4745,6 +4850,24 @@ nvk_mme_emit_view_index(struct mme_builder *b, struct mme_value view_index)
    mme_emit(b, view_index);
 }
 
+/* On Fermi, once the compute class has bound constant buffers, a draw that
+ * is not followed by a write to the 3D root table reads the first compute
+ * buffer in place of it: the last draw of a render pass drew with a first
+ * instance and a view index of zero.  A write into the root table's unused
+ * word after every draw keeps that from happening.
+ */
+static void
+nvk_mme_fermi_after_draw(struct mme_builder *b)
+{
+   if (b->devinfo->cls_eng3d >= KEPLER_A)
+      return;
+
+   mme_mthd(b, NV9097_LOAD_CONSTANT_BUFFER_OFFSET);
+   mme_emit(b, mme_imm(nvk_root_descriptor_offset(draw.__padding)));
+   mme_mthd(b, NV9097_LOAD_CONSTANT_BUFFER(0));
+   mme_emit(b, mme_zero());
+}
+
 static void
 nvk_mme_build_draw_loop(struct mme_builder *b,
                         struct mme_value instance_count,
@@ -4802,6 +4925,8 @@ nvk_mme_build_draw_loop(struct mme_builder *b,
 
       mme_free_reg(b, begin);
    }
+
+   nvk_mme_fermi_after_draw(b);
 
 }
 
@@ -4977,6 +5102,8 @@ nvk_mme_build_draw_indexed_loop(struct mme_builder *b,
 
       mme_free_reg(b, begin);
    }
+
+   nvk_mme_fermi_after_draw(b);
 }
 
 static void
@@ -5466,6 +5593,8 @@ nvk_mme_xfb_draw_indirect_loop(struct mme_builder *b,
    }
 
    mme_free_reg(b, begin);
+
+   nvk_mme_fermi_after_draw(b);
 }
 
 void
@@ -5972,7 +6101,17 @@ nvk_cmd_begin_cond_render_copy_engine(struct nvk_cmd_buffer *cmd,
    /* Frustratingly, the u64s are not packed together */
    const uint64_t operand_a_addr = tmp_addr + 0;
 
-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 15);
+   struct nv_push *p;
+
+   if (nvk_cmd_buffer_is_fermi(cmd)) {
+      /* M2MF here: nouveau's copy firmware would not take these methods */
+      nvk_cmd_m2mf_copy_linear(cmd, operand_a_addr, addr, 4);
+      p = nvk_cmd_buffer_push(cmd, 6);
+      __push_immd(p, SUBC_NV9039, 0x0110, 0); /* WAIT_FOR_IDLE */
+      goto compare;
+   }
+
+   p = nvk_cmd_buffer_push(cmd, 15);
 
    /* Copy value into operand A */
    P_MTHD(p, NV90B5, OFFSET_IN_UPPER);
@@ -5994,6 +6133,7 @@ nvk_cmd_begin_cond_render_copy_engine(struct nvk_cmd_buffer *cmd,
       .remap_enable = REMAP_ENABLE_FALSE,
    });
 
+compare:
    /* Compare the operands */
    if (nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NV9097) {
       P_MTHD(p, NV9097, SET_GLOBAL_RENDER_ENABLE_A);

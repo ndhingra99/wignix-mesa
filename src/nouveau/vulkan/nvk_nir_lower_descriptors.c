@@ -12,6 +12,7 @@
 #include "nir_builder.h"
 #include "nir_deref.h"
 
+#include "cla097.h"
 #include "clb097.h"
 #include "clc397.h"
 #include "clc597.h"
@@ -1254,6 +1255,115 @@ lower_edb_buffer_tex_instr(nir_builder *b, nir_tex_instr *tex,
    }
 }
 
+/* Where element elem of the binding a texture or sampler deref names sits
+ * in its set.
+ */
+static struct nvk_tex_unit
+tex_unit_for_elem(nir_deref_instr *var_deref, uint32_t elem,
+                  uint32_t plane_offset_B,
+                  const struct lower_descriptors_ctx *ctx)
+{
+   assert(var_deref->deref_type == nir_deref_type_var);
+
+   const uint32_t set = var_deref->var->data.descriptor_set;
+   const struct nvk_descriptor_set_binding_layout *binding_layout =
+      &ctx->set_layouts[set]->binding[var_deref->var->data.binding];
+
+   return (struct nvk_tex_unit) {
+      .type = NVK_TEX_UNIT_TYPE_DESC,
+      .desc_set = set,
+      .desc_offset = binding_layout->offset +
+                     MIN2(elem, binding_layout->array_size - 1) *
+                     binding_layout->stride + plane_offset_B,
+   };
+}
+
+static struct nvk_tex_unit
+tex_unit_for_deref(nir_deref_instr *deref, uint32_t plane_offset_B,
+                   const struct lower_descriptors_ctx *ctx)
+{
+   uint32_t elem = 0;
+   if (deref->deref_type == nir_deref_type_array) {
+      if (nir_src_is_const(deref->arr.index))
+         elem = nir_src_as_uint(deref->arr.index);
+      deref = nir_deref_instr_parent(deref);
+   }
+   return tex_unit_for_elem(deref, elem, plane_offset_B, ctx);
+}
+
+static uint32_t
+get_tex_unit(struct nvk_tex_unit *units, uint16_t *count, uint32_t max,
+             struct nvk_tex_unit unit)
+{
+   for (uint32_t i = 0; i < *count; i++) {
+      if (!memcmp(&units[i], &unit, sizeof(unit)))
+         return i;
+   }
+
+   if (*count >= max) {
+      /* more than the hardware has; the limits we report rule this out */
+      assert(!"Too many texture or sampler units in one shader");
+      return 0;
+   }
+
+   units[*count] = unit;
+   return (*count)++;
+}
+
+/* The unit for a texture or sampler deref.  A constant array index names
+ * one unit.  An index computed at run time gets the whole array as
+ * consecutive units (reusing a run that is already there) and the unit is
+ * the first one plus the index, clamped to the array.
+ */
+static nir_def *
+tex_unit_def(nir_builder *b, struct nvk_tex_unit *units, uint16_t *count,
+             uint32_t max, nir_deref_instr *deref, uint32_t plane_offset_B,
+             const struct lower_descriptors_ctx *ctx)
+{
+   if (deref->deref_type != nir_deref_type_array ||
+       nir_src_is_const(deref->arr.index)) {
+      return nir_imm_int(b, get_tex_unit(units, count, max,
+                                         tex_unit_for_deref(deref,
+                                                            plane_offset_B,
+                                                            ctx)));
+   }
+
+   nir_deref_instr *var_deref = nir_deref_instr_parent(deref);
+   const uint32_t set = var_deref->var->data.descriptor_set;
+   const uint32_t array_size =
+      ctx->set_layouts[set]->binding[var_deref->var->data.binding].array_size;
+
+   uint32_t first = *count;
+   for (uint32_t start = 0; start + array_size <= *count; start++) {
+      uint32_t e = 0;
+      for (; e < array_size; e++) {
+         struct nvk_tex_unit unit =
+            tex_unit_for_elem(var_deref, e, plane_offset_B, ctx);
+         if (memcmp(&units[start + e], &unit, sizeof(unit)))
+            break;
+      }
+      if (e == array_size) {
+         first = start;
+         break;
+      }
+   }
+
+   if (first == *count) {
+      if (*count + array_size > max) {
+         /* more than the hardware has; the limits we report rule this out */
+         assert(!"Too many texture or sampler units in one shader");
+         return nir_imm_int(b, 0);
+      }
+      for (uint32_t e = 0; e < array_size; e++)
+         units[(*count)++] = tex_unit_for_elem(var_deref, e, plane_offset_B,
+                                               ctx);
+   }
+
+   nir_def *index = nir_umin(b, nir_u2u32(b, deref->arr.index.ssa),
+                             nir_imm_int(b, array_size - 1));
+   return nir_iadd_imm(b, index, first);
+}
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex,
           const struct lower_descriptors_ctx *ctx)
@@ -1281,6 +1391,45 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
 
    const uint64_t plane_offset_B =
       plane * sizeof(struct nvk_sampled_image_descriptor);
+
+   if (ctx->dev_info->cls_eng3d < KEPLER_A) {
+      /* No handles before Kepler: name a texture unit and a sampler unit */
+      struct nvk_cbuf_map *map = ctx->cbuf_map;
+      assert(map != NULL);
+
+      nir_def *tex_unit =
+         tex_unit_def(b, map->tex_units, &map->tex_unit_count,
+                      NVK_MAX_TEX_UNITS, texture, plane_offset_B, ctx);
+
+      nir_def *samp_unit;
+      if (nir_tex_instr_need_sampler(tex)) {
+         samp_unit = tex_unit_def(b, map->sampler_units,
+                                  &map->sampler_unit_count,
+                                  NVK_MAX_SAMPLER_UNITS,
+                                  sampler != NULL ? sampler : texture,
+                                  plane_offset_B, ctx);
+      } else {
+         struct nvk_tex_unit samp = { .type = NVK_TEX_UNIT_TYPE_TXF_SAMPLER };
+         samp_unit = nir_imm_int(b, get_tex_unit(map->sampler_units,
+                                                 &map->sampler_unit_count,
+                                                 NVK_MAX_SAMPLER_UNITS, samp));
+      }
+
+      /* constant units stay an immediate so NAK can put them in the
+       * instruction
+       */
+      nir_def *handle;
+      if (nir_src_is_const(nir_src_for_ssa(tex_unit)) &&
+          nir_src_is_const(nir_src_for_ssa(samp_unit))) {
+         handle = nir_imm_int(b, nir_src_as_uint(nir_src_for_ssa(tex_unit)) |
+                                 (nir_src_as_uint(nir_src_for_ssa(samp_unit)) << 8));
+      } else {
+         handle = nir_ior(b, tex_unit, nir_ishl_imm(b, samp_unit, 8));
+      }
+
+      nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
+      return true;
+   }
 
    nir_def *texture_desc =
          load_resource_deref_desc(b, 1, 32, texture, plane_offset_B, ctx);
@@ -1559,8 +1708,13 @@ nvk_nir_lower_descriptors(nir_shader *nir,
          rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ||
          rs->uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ||
          rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
+      /* also for Fermi compute shaders, which get no constant buffers but
+       * the root table (nvk_lower_nir)
+       */
       .indirect_bind =
-         shader_flags & VK_SHADER_CREATE_INDIRECT_BINDABLE_BIT_EXT,
+         (shader_flags & VK_SHADER_CREATE_INDIRECT_BINDABLE_BIT_EXT) ||
+         (nir->info.stage == MESA_SHADER_COMPUTE &&
+          pdev->info.cls_eng3d < KEPLER_A),
       .has_task_shader = (shader_flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT) == 0,
       .ssbo_addr_format = nvk_ssbo_addr_format(pdev, rs),
       .ubo_addr_format = nvk_ubo_addr_format(pdev, rs),

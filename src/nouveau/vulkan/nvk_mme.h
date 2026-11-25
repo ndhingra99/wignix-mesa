@@ -46,6 +46,8 @@ enum nvk_mme {
    NVK_MME_DRAW_MESH_INDIRECT,
    NVK_MME_DRAW_MESH_INDIRECT_COUNT,
 
+   NVK_MME_FERMI_LAUNCH_GRID,
+
    NVK_MME_COUNT,
 };
 
@@ -249,6 +251,7 @@ void nvk_mme_draw_indexed_indirect_count(struct mme_builder *b);
 void nvk_mme_begin_cond_render(struct mme_builder *b);
 void nvk_mme_add_cs_invocations(struct mme_builder *b);
 void nvk_mme_dispatch_indirect(struct mme_builder *b);
+void nvk_mme_fermi_launch_grid(struct mme_builder *b);
 void nvk_mme_write_cs_invocations(struct mme_builder *b);
 void nvk_mme_xfb_counter_load(struct mme_builder *b);
 void nvk_mme_xfb_draw_indirect(struct mme_builder *b);

@@ -12,6 +12,8 @@
 
 #include "util/u_atomic.h"
 
+#include "cla097.h"
+
 #include <inttypes.h>
 #include <sys/mman.h>
 
@@ -203,8 +205,19 @@ nvk_AllocateMemory(VkDevice device,
       }
    }
 
-   const enum nvkmd_mem_flags flags =
+   enum nvkmd_mem_flags flags =
       nvk_memory_type_flags(type, handle_types, pinned_to_vram);
+
+   /* Chromium exports the memory of its shared images by fd for Dawn even
+    * when it created them without external memory, which it does when the
+    * GL driver has no memory objects, as nouveau's has not
+    * (ExternalVkImageBacking, support_vulkan_external_object).  Memory that
+    * is not shareable cannot be exported, and WebGPU then has no texture
+    * to present.  On Fermi, where that GL driver is the one in use, memory
+    * dedicated to an image is always shareable.
+    */
+   if (pdev->info.cls_eng3d < KEPLER_A && mem->dedicated_image != NULL)
+      flags |= NVKMD_MEM_SHARED;
 
    const uint64_t aligned_size =
       align64(pAllocateInfo->allocationSize, alignment);

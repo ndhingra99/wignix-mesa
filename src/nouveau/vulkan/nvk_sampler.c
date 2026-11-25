@@ -208,11 +208,16 @@ nvk_sampler_get_header(const struct nvk_physical_device *pdev,
       UNREACHABLE("Invalid mipmap mode");
    }
 
-   assert(pdev->info.cls_eng3d >= KEPLER_A);
-   if (state->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT) {
-      SAMP_SET_E(samp, NVA097, 1, CUBEMAP_INTERFACE_FILTERING, USE_WRAP);
-   } else {
-      SAMP_SET_E(samp, NVA097, 1, CUBEMAP_INTERFACE_FILTERING, AUTO_SPAN_SEAM);
+   /* Fermi's sampler has no cube map seam field (seamless filtering is a 3D
+    * engine setting there) and no coordinate normalization field (that is
+    * part of the texture header).
+    */
+   if (pdev->info.cls_eng3d >= KEPLER_A) {
+      if (state->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT) {
+         SAMP_SET_E(samp, NVA097, 1, CUBEMAP_INTERFACE_FILTERING, USE_WRAP);
+      } else {
+         SAMP_SET_E(samp, NVA097, 1, CUBEMAP_INTERFACE_FILTERING, AUTO_SPAN_SEAM);
+      }
    }
 
    if (pdev->info.cls_eng3d >= MAXWELL_B) {
@@ -233,13 +238,14 @@ nvk_sampler_get_header(const struct nvk_physical_device *pdev,
 
    SAMP_SET_SF(samp, NV9097, 1, MIP_LOD_BIAS, state->mip_lod_bias);
 
-   assert(pdev->info.cls_eng3d >= KEPLER_A);
-   if (state->unnormalized_coordinates) {
-      SAMP_SET_E(samp, NVA097, 1, FLOAT_COORD_NORMALIZATION,
-                                  FORCE_UNNORMALIZED_COORDS);
-   } else {
-      SAMP_SET_E(samp, NVA097, 1, FLOAT_COORD_NORMALIZATION,
-                                  USE_HEADER_SETTING);
+   if (pdev->info.cls_eng3d >= KEPLER_A) {
+      if (state->unnormalized_coordinates) {
+         SAMP_SET_E(samp, NVA097, 1, FLOAT_COORD_NORMALIZATION,
+                                     FORCE_UNNORMALIZED_COORDS);
+      } else {
+         SAMP_SET_E(samp, NVA097, 1, FLOAT_COORD_NORMALIZATION,
+                                     USE_HEADER_SETTING);
+      }
    }
    SAMP_SET_U(samp, NV9097, 1, TRILIN_OPT,
               vk_to_9097_trilin_opt(state->max_anisotropy));

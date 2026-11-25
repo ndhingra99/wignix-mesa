@@ -11,7 +11,58 @@
 #include "vk_alloc.h"
 
 #include "nv_push.h"
+#include "nv_push_cl9039.h"
 #include "nv_push_cl90b5.h"
+#include "cla097.h"
+
+/* Before Kepler the copy class does nothing with these commands; uploads go
+ * through M2MF there, as in the GL driver (nvc0_m2mf_copy_linear).
+ */
+static bool
+nvk_upload_queue_uses_m2mf(struct nvk_device *dev)
+{
+   return nvk_device_physical(dev)->info.cls_eng3d < KEPLER_A;
+}
+
+static enum nvkmd_engines
+nvk_upload_queue_engine(struct nvk_device *dev)
+{
+   return nvk_upload_queue_uses_m2mf(dev) ? NVKMD_ENGINE_M2MF
+                                          : NVKMD_ENGINE_COPY;
+}
+
+static void
+nvk_upload_queue_push_init(struct nvk_device *dev,
+                           struct nvk_upload_queue *queue)
+{
+   nv_push_init(&queue->push, queue->push_data, ARRAY_SIZE(queue->push_data),
+                nvk_queue_subchannels_from_engines(
+                   nvk_upload_queue_engine(dev)));
+}
+
+/* One linear copy of at most 128 KiB */
+static void
+nvk_upload_queue_m2mf_copy(struct nv_push *p, uint64_t dst_addr,
+                           uint64_t src_addr, uint32_t size)
+{
+   __push_mthd(p, SUBC_NV9039, 0x0238); /* OFFSET_OUT_HIGH, LOW */
+   P_INLINE_DATA(p, dst_addr >> 32);
+   P_INLINE_DATA(p, dst_addr & 0xffffffff);
+   __push_mthd(p, SUBC_NV9039, 0x030c); /* OFFSET_IN_HIGH, LOW */
+   P_INLINE_DATA(p, src_addr >> 32);
+   P_INLINE_DATA(p, src_addr & 0xffffffff);
+   __push_mthd(p, SUBC_NV9039, 0x031c); /* LINE_LENGTH_IN, LINE_COUNT */
+   P_INLINE_DATA(p, size);
+   P_INLINE_DATA(p, 1);
+   __push_mthd(p, SUBC_NV9039, 0x0300); /* EXEC: linear in and out */
+   P_INLINE_DATA(p, (1 << 20) | 0x10 | 0x100);
+   /* The copy runs on after the method has been taken; whoever waits for
+    * this queue's time point (a submit that uses a shader uploaded here)
+    * must find the data in place.
+    */
+   __push_mthd(p, SUBC_NV9039, 0x0110); /* WAIT_FOR_IDLE */
+   P_INLINE_DATA(p, 0);
+}
 
 VkResult
 nvk_upload_queue_init(struct nvk_device *dev,
@@ -24,7 +75,7 @@ nvk_upload_queue_init(struct nvk_device *dev,
    simple_mtx_init(&queue->mutex, mtx_plain);
 
    result = nvkmd_dev_create_ctx(dev->nvkmd, &dev->vk.base,
-                                 NVKMD_ENGINE_COPY, &queue->ctx);
+                                 nvk_upload_queue_engine(dev), &queue->ctx);
    if (result != VK_SUCCESS)
       goto fail_mutex;
 
@@ -32,8 +83,17 @@ nvk_upload_queue_init(struct nvk_device *dev,
    if (result != VK_SUCCESS)
       goto fail_ctx;
 
-   nv_push_init(&queue->push, queue->push_data, ARRAY_SIZE(queue->push_data),
-                nvk_queue_subchannels_from_engines(NVKMD_ENGINE_COPY));
+   nvk_upload_queue_push_init(dev, queue);
+
+   if (nvk_upload_queue_uses_m2mf(dev)) {
+      /* the subchannel has to be told its object, once */
+      struct nv_push *p = &queue->push;
+      P_MTHD(p, NV9039, SET_OBJECT);
+      P_NV9039_SET_OBJECT(p, {
+         .class_id = nvk_device_physical(dev)->info.cls_m2mf,
+         .engine_id = 0,
+      });
+   }
 
    return VK_SUCCESS;
 
@@ -78,8 +138,7 @@ nvk_upload_queue_flush_locked(struct nvk_device *dev,
    if (result != VK_SUCCESS)
       return result;
 
-   nv_push_init(&queue->push, queue->push_data, ARRAY_SIZE(queue->push_data),
-                nvk_queue_subchannels_from_engines(NVKMD_ENGINE_COPY));
+   nvk_upload_queue_push_init(dev, queue);
 
    if (time_point_out != NULL)
       *time_point_out = queue->last_time_point;
@@ -143,7 +202,7 @@ nvk_upload_queue_upload_locked(struct nvk_device *dev,
    assert(size % 4 == 0);
 
    while (size > 0) {
-      const uint32_t cmd_size_dw = 12;
+      const uint32_t cmd_size_dw = 14;
       if (queue->push.end + cmd_size_dw > queue->push.limit) {
          result = nvk_upload_queue_flush_locked(dev, queue, NULL);
          if (result != VK_SUCCESS)
@@ -163,6 +222,15 @@ nvk_upload_queue_upload_locked(struct nvk_device *dev,
       memcpy(data_map, src, data_size);
 
       assert(data_size <= (1 << 17));
+
+      if (nvk_upload_queue_uses_m2mf(dev)) {
+         nvk_upload_queue_m2mf_copy(p, dst_addr, data_addr, data_size);
+
+         dst_addr += data_size;
+         src += data_size;
+         size -= data_size;
+         continue;
+      }
 
       P_MTHD(p, NV90B5, OFFSET_IN_UPPER);
       P_NV90B5_OFFSET_IN_UPPER(p, data_addr >> 32);
@@ -216,13 +284,34 @@ nvk_upload_queue_fill_locked(struct nvk_device *dev,
    assert(size % 4 == 0);
 
    while (size > 0) {
-      const uint32_t cmd_size_dw = 14;
+      const uint32_t cmd_size_dw = 16;
       if (queue->push.end + cmd_size_dw > queue->push.limit) {
          result = nvk_upload_queue_flush_locked(dev, queue, NULL);
          if (result != VK_SUCCESS)
             return result;
       }
       struct nv_push *p = &queue->push;
+
+      if (nvk_upload_queue_uses_m2mf(dev)) {
+         /* M2MF has no constant source: copy from a block of the value */
+         const uint32_t fill_size = MIN2(size, NVK_MEM_STREAM_MAX_ALLOC_SIZE);
+
+         uint64_t fill_addr;
+         void *fill_map;
+         result = nvk_mem_stream_alloc(dev, &queue->stream, fill_size, 4,
+                                       &fill_addr, &fill_map);
+         if (result != VK_SUCCESS)
+            return result;
+
+         for (uint32_t i = 0; i < fill_size / 4; i++)
+            ((uint32_t *)fill_map)[i] = data;
+
+         nvk_upload_queue_m2mf_copy(p, dst_addr, fill_addr, fill_size);
+
+         dst_addr += fill_size;
+         size -= fill_size;
+         continue;
+      }
 
       const uint32_t max_dim = 1 << 17;
       uint32_t width_B, height;

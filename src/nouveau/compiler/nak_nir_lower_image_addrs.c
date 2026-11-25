@@ -420,6 +420,303 @@ compute_address_from_ga_offset(nir_builder *b, nir_def *addr,
    return full_addr;
 }
 
+/* Fermi (SM20) has none of the surface instructions used above.  The
+ * address of a texel is computed with ordinary integer operations from the
+ * same descriptor, and the access is a plain global load or store with the
+ * format conversion done here.
+ *
+ * Block linear: a tile is 64 bytes wide, 2^th rows high (th = 3 + y_log2)
+ * and 2^td slices deep; tiles follow each other row by row (and slice of
+ * tiles by slice of tiles for 3D).  Inside a tile the 512-byte GOBs are
+ * stacked by row within a slice, and inside a GOB the bytes are swizzled:
+ * bit 8 = x5, bit 7 = y2, bit 6 = x4, bits 5..4 = y1..y0, bits 3..0 =
+ * x3..x0 (measured on a GF106 against what M2MF reads back).
+ */
+static nir_def *
+su_clamp_bits(nir_builder *b, nir_def *clamp, unsigned lo, unsigned n)
+{
+   return nir_ubitfield_extract_imm(b, clamp, lo, n);
+}
+
+static nir_def *
+su_addr64(nir_builder *b, nir_def *shifted8)
+{
+   return nir_pack_64_2x32_split(b, nir_ishl_imm(b, shifted8, 8),
+                                    nir_ushr_imm(b, shifted8, 24));
+}
+
+static void
+compute_image_address_sm20(nir_builder *b,
+                           nir_intrinsic_instr *intrin,
+                           enum glsl_sampler_dim sampler_dim,
+                           nir_def **addr,
+                           nir_def **is_oob)
+{
+   nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+
+   const unsigned dim = sampler_dim_len(sampler_dim);
+   const bool is_cube = sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   const bool is_array = nir_intrinsic_image_array(intrin) || is_cube;
+
+   nir_def *base_addr = load_su_info(b, deref, addr_shifted8);
+   *is_oob = nir_ieq_imm(b, base_addr, 0);
+
+   nir_def *coords[3];
+   for (int i = 0; i < 3; i++)
+      coords[i] = nir_channel(b, intrin->src[1].ssa, i);
+
+   if (sampler_dim == GLSL_SAMPLER_DIM_MS) {
+      nir_def *s = intrin->src[2].ssa;
+      nir_def *sw_log2, *sh_log2;
+      load_sample_size(b, deref, &sw_log2, &sh_log2);
+      nir_def *s_map = load_su_info(b, deref, extra);
+      nir_def *num_samples = nir_ishl(b, nir_imm_int(b, 1),
+                                      nir_iadd(b, sw_log2, sh_log2));
+
+      nir_def *s_xy = nir_ushr(b, s_map, nir_imul_imm(b, s, 4));
+      nir_def *sx = nir_ubitfield_extract_imm(b, s_xy, 0, 2);
+      nir_def *sy = nir_ubitfield_extract_imm(b, s_xy, 2, 2);
+
+      coords[0] = nir_iadd(b, nir_ishl(b, coords[0], sw_log2), sx);
+      coords[1] = nir_iadd(b, nir_ishl(b, coords[1], sh_log2), sy);
+
+      *is_oob = nir_ior(b, *is_oob, nir_uge(b, s, num_samples));
+   }
+
+   nir_def *clamp_x = load_su_info(b, deref, clamp_x);
+   nir_def *clamp_y = load_su_info(b, deref, clamp_y);
+   nir_def *clamp_z = load_su_info(b, deref, clamp_z);
+   nir_def *pitch = nir_iand_imm(b, load_su_info(b, deref, pitch), 0xffffff);
+
+   nir_def *x = coords[0];
+   nir_def *y = dim >= 2 ? coords[1] : nir_imm_int(b, 0);
+   nir_def *z = dim >= 3 ? coords[2] : nir_imm_int(b, 0);
+
+   *is_oob = nir_ior(b, *is_oob,
+                     nir_ult(b, su_clamp_bits(b, clamp_x, 0, 20), x));
+   if (dim >= 2) {
+      *is_oob = nir_ior(b, *is_oob,
+                        nir_ult(b, su_clamp_bits(b, clamp_y, 0, 20), y));
+   }
+   if (dim >= 3) {
+      *is_oob = nir_ior(b, *is_oob,
+                        nir_ult(b, su_clamp_bits(b, clamp_z, 0, 20), z));
+   }
+
+   nir_def *el_log2 = su_clamp_bits(b, clamp_x, 26, 3);
+   nir_def *is_linear = nir_ine_imm(b, su_clamp_bits(b, clamp_x, 21, 1), 0);
+
+   /* pitch linear: the pitch is in elements */
+   nir_def *off_linear =
+      nir_ishl(b, nir_iadd(b, nir_imul(b, y, pitch), x), el_log2);
+
+   /* block linear: the pitch is in tiles */
+   nir_def *xb = nir_ishl(b, x, el_log2);
+   nir_def *th = su_clamp_bits(b, clamp_y, 22, 4);
+   nir_def *one = nir_imm_int(b, 1);
+   nir_def *xi = nir_iand_imm(b, xb, 63);
+   nir_def *yi = nir_iand(b, y, nir_iadd_imm(b, nir_ishl(b, one, th), -1));
+   nir_def *tile = nir_iadd(b, nir_imul(b, nir_ushr(b, y, th), pitch),
+                               nir_ushr_imm(b, xb, 6));
+   nir_def *tile_shift = nir_iadd_imm(b, th, 6);
+   nir_def *in_tile = nir_ishl_imm(b, nir_ushr_imm(b, yi, 3), 9);
+   if (dim >= 3) {
+      nir_def *td = su_clamp_bits(b, clamp_z, 22, 4);
+      nir_def *height_t =
+         nir_iadd_imm(b, nir_ushr(b, su_clamp_bits(b, clamp_y, 0, 20), th), 1);
+      nir_def *zi = nir_iand(b, z, nir_iadd_imm(b, nir_ishl(b, one, td), -1));
+
+      tile = nir_iadd(b, nir_imul(b, nir_imul(b, nir_ushr(b, z, td),
+                                                 height_t), pitch), tile);
+      in_tile = nir_iadd(b, in_tile, nir_ishl(b, zi, tile_shift));
+      tile_shift = nir_iadd(b, tile_shift, td);
+   }
+   nir_def *in_gob =
+      nir_ior(b, nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, xi, 0x20), 3),
+                            nir_ishl_imm(b, nir_iand_imm(b, yi, 0x4), 5)),
+                 nir_ior(b, nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, xi, 0x10), 2),
+                                       nir_ishl_imm(b, nir_iand_imm(b, yi, 0x3), 4)),
+                            nir_iand_imm(b, xi, 0xf)));
+   nir_def *off_tiled =
+      nir_iadd(b, nir_ishl(b, tile, tile_shift), nir_iadd(b, in_tile, in_gob));
+
+   nir_def *off = nir_bcsel(b, is_linear, off_linear, off_tiled);
+   *addr = nir_iadd(b, su_addr64(b, base_addr), nir_u2u64(b, off));
+
+   if (is_array) {
+      nir_def *idx = coords[dim];
+      nir_def *stride = load_su_info(b, deref, array_stride_shifted8);
+
+      *is_oob = nir_ior(b, *is_oob,
+                        nir_ult(b, su_clamp_bits(b, clamp_z, 0, 20), idx));
+      *addr = nir_iadd(b, *addr, su_addr64(b, nir_imul(b, idx, stride)));
+   }
+}
+
+static void
+compute_buffer_address_sm20(nir_builder *b,
+                            nir_intrinsic_instr *intrin,
+                            nir_def **addr,
+                            nir_def **is_oob)
+{
+   nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+
+   nir_def *num_elems = load_su_info(b, deref, clamp_x);
+   nir_def *el_size_B = load_su_info(b, deref, pitch);
+   nir_def *lower_addr = load_su_info(b, deref, extra);
+   nir_def *base_addr = load_su_info(b, deref, addr_shifted8);
+   nir_def *x = nir_channel(b, intrin->src[1].ssa, 0);
+
+   *is_oob = nir_uge(b, x, num_elems);
+   *addr = nir_iadd(b, su_addr64(b, base_addr),
+                    nir_u2u64(b, nir_iadd(b, nir_imul(b, x, el_size_B),
+                                             lower_addr)));
+}
+
+static void
+lower_image_access_sm20(nir_builder *b, nir_intrinsic_instr *intrin)
+{
+   b->cursor = nir_instr_remove(&intrin->instr);
+   nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+
+   enum pipe_format format = nir_intrinsic_format(intrin);
+   if (format == PIPE_FORMAT_NONE)
+      format = nir_deref_instr_get_variable(deref)->data.image.format;
+
+   const enum glsl_sampler_dim sampler_dim = nir_intrinsic_image_dim(intrin);
+
+   nir_def *addr, *is_oob;
+   if (sampler_dim != GLSL_SAMPLER_DIM_BUF)
+      compute_image_address_sm20(b, intrin, sampler_dim, &addr, &is_oob);
+   else
+      compute_buffer_address_sm20(b, intrin, &addr, &is_oob);
+
+   /* without a format there is no way to know what to read or write */
+   const unsigned bits = format == PIPE_FORMAT_NONE ? 0 :
+                         util_format_get_blocksizebits(format);
+   const unsigned words = DIV_ROUND_UP(bits, 32);
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_image_deref_load: {
+      nir_def *raw[4] = { NULL };
+      nir_def *zero = nir_imm_int(b, 0);
+
+      nir_push_if(b, nir_inot(b, is_oob));
+      for (unsigned i = 0; i < words; i++) {
+         nir_def *a = nir_iadd_imm(b, addr, i * 4);
+         if (bits == 8)
+            raw[i] = nir_u2u32(b, nir_load_global(b, 1, 8, a, .align_mul = 1));
+         else if (bits == 16)
+            raw[i] = nir_u2u32(b, nir_load_global(b, 1, 16, a, .align_mul = 2));
+         else
+            raw[i] = nir_load_global(b, 1, 32, a, .align_mul = 4);
+      }
+      nir_pop_if(b, NULL);
+      for (unsigned i = 0; i < words; i++)
+         raw[i] = nir_if_phi(b, raw[i], zero);
+
+      nir_def *rgba;
+      if (words == 0) {
+         rgba = nir_imm_zero(b, 4, intrin->def.bit_size);
+      } else if (format == PIPE_FORMAT_R64_UINT ||
+                 format == PIPE_FORMAT_R64_SINT) {
+         rgba = nir_vec4(b, nir_pack_64_2x32_split(b, raw[0], raw[1]),
+                            nir_imm_int64(b, 0), nir_imm_int64(b, 0),
+                            nir_imm_int64(b, 1));
+      } else {
+         rgba = nir_format_unpack_rgba(b, nir_vec(b, raw, words), format);
+      }
+      nir_def_rewrite_uses(&intrin->def,
+                           nir_trim_vector(b, rgba,
+                                           intrin->def.num_components));
+      break;
+   }
+   case nir_intrinsic_image_deref_store: {
+      if (words == 0)
+         break;
+
+      nir_def *packed;
+      if (format == PIPE_FORMAT_R64_UINT || format == PIPE_FORMAT_R64_SINT) {
+         packed = nir_unpack_64_2x32(b, nir_channel(b, intrin->src[3].ssa, 0));
+      } else {
+         packed = nir_format_pack_rgba(b, format, intrin->src[3].ssa);
+      }
+
+      nir_push_if(b, nir_inot(b, is_oob));
+      for (unsigned i = 0; i < words; i++) {
+         nir_def *a = nir_iadd_imm(b, addr, i * 4);
+         nir_def *w = nir_channel(b, packed, i);
+         if (bits == 8)
+            nir_store_global(b, nir_u2u8(b, w), a, .align_mul = 1);
+         else if (bits == 16)
+            nir_store_global(b, nir_u2u16(b, w), a, .align_mul = 2);
+         else
+            nir_store_global(b, w, a, .align_mul = 4);
+      }
+      nir_pop_if(b, NULL);
+      break;
+   }
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap: {
+      nir_atomic_op atomic_op = nir_intrinsic_atomic_op(intrin);
+      const unsigned bit_size = (format == PIPE_FORMAT_R64_UINT ||
+                                 format == PIPE_FORMAT_R64_SINT) ? 64 : 32;
+
+      nir_def *res_ib, *res_oob;
+      nir_push_if(b, nir_inot(b, is_oob));
+      if (intrin->intrinsic == nir_intrinsic_image_deref_atomic) {
+         res_ib = nir_global_atomic(b, bit_size, addr, intrin->src[3].ssa,
+                                    .atomic_op = atomic_op);
+      } else {
+         res_ib = nir_global_atomic_swap(b, bit_size, addr,
+                                         intrin->src[3].ssa,
+                                         intrin->src[4].ssa,
+                                         .atomic_op = atomic_op);
+      }
+      nir_push_else(b, NULL); {
+         res_oob = nir_imm_intN_t(b, 0, bit_size);
+      }
+      nir_pop_if(b, NULL);
+      nir_def_rewrite_uses(&intrin->def, nir_if_phi(b, res_ib, res_oob));
+      break;
+   }
+   default:
+      UNREACHABLE("Unknown image intrinsic");
+   }
+}
+
+/* The sizes are stored as the largest valid coordinate. */
+static void
+lower_image_size_sm20(nir_builder *b, nir_intrinsic_instr *intrin)
+{
+   b->cursor = nir_instr_remove(&intrin->instr);
+   nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);
+
+   const unsigned dim = sampler_dim_len(nir_intrinsic_image_dim(intrin));
+   const bool is_array = nir_intrinsic_image_array(intrin);
+   const unsigned cdim = dim + is_array;
+   assert(cdim <= 3);
+   nir_def *comps[3];
+
+   nir_def *present =
+      nir_b2i32(b, nir_ine_imm(b, load_su_info(b, deref, addr_shifted8), 0));
+
+   for (unsigned i = 0; i < cdim; i++) {
+      nir_def *clamp = load_su_info_clamp(b, deref, i);
+      comps[i] = nir_imul(b, nir_iadd_imm(b, su_clamp_bits(b, clamp, 0, 20), 1),
+                             present);
+   }
+   if (nir_intrinsic_image_dim(intrin) == GLSL_SAMPLER_DIM_MS) {
+      nir_def *ms_w_log2, *ms_h_log2;
+      load_sample_size(b, deref, &ms_w_log2, &ms_h_log2);
+
+      comps[0] = nir_ishr(b, comps[0], ms_w_log2);
+      comps[1] = nir_ishr(b, comps[1], ms_h_log2);
+   }
+
+   nir_def_rewrite_uses(&intrin->def, nir_vec(b, comps, cdim));
+}
+
 static void
 lower_image_access(nir_builder *b, nir_intrinsic_instr *intrin)
 {
@@ -589,16 +886,24 @@ lower_image_intrin(nir_builder *b,
                    nir_intrinsic_instr *intrin,
                    void *_data)
 {
+   const struct nak_compiler *nak = _data;
+   const bool sm20 = nak->sm < 30;
+
    switch (intrin->intrinsic) {
    case nir_intrinsic_image_deref_load:
    case nir_intrinsic_image_deref_store:
    case nir_intrinsic_image_deref_atomic:
    case nir_intrinsic_image_deref_atomic_swap:
-      lower_image_access(b, intrin);
+      if (sm20)
+         lower_image_access_sm20(b, intrin);
+      else
+         lower_image_access(b, intrin);
       return true;
    case nir_intrinsic_image_deref_size:
       if (nir_intrinsic_image_dim(intrin) == GLSL_SAMPLER_DIM_BUF) {
          lower_buffer_size(b, intrin);
+      } else if (sm20) {
+         lower_image_size_sm20(b, intrin);
       } else {
          lower_image_size(b, intrin);
       }

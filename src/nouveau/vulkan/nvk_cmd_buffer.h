@@ -121,6 +121,35 @@ struct nvk_descriptor_state {
    uint32_t push_dirty;
 };
 
+/* The descriptor a texture or sampler unit of a shader stands for, or NULL
+ * if nothing is bound there.
+ */
+static inline const struct nvk_sampled_image_descriptor *
+nvk_cmd_buffer_get_tex_unit_desc(const struct nvk_descriptor_state *desc,
+                                 const struct nvk_tex_unit *unit)
+{
+   if (unit->type != NVK_TEX_UNIT_TYPE_DESC)
+      return NULL;
+
+   const struct nvk_descriptor_set_binding *binding =
+      &desc->sets[unit->desc_set];
+   const uint8_t *data;
+
+   switch (binding->type) {
+   case NVK_DESCRIPTOR_SET_TYPE_SET:
+      data = binding->set->map;
+      break;
+   case NVK_DESCRIPTOR_SET_TYPE_PUSH:
+      data = binding->push->data;
+      break;
+   default:
+      return NULL;
+   }
+
+   return (const struct nvk_sampled_image_descriptor *)
+          (data + unit->desc_offset);
+}
+
 #define nvk_descriptor_state_get_root(desc, member, dst) do { \
    const struct nvk_root_descriptor_table *root = \
       (const struct nvk_root_descriptor_table *)(desc)->root; \
@@ -209,6 +238,11 @@ struct nvk_graphics_state {
       uint16_t dirty;
       struct nvk_cbuf cbufs[16];
    } cbuf_groups[5];
+
+   /* Fermi: the next draw has to bind its constant buffers and its texture
+    * and sampler units with the method filter off (nvk_cmd_flush_gfx_state)
+    */
+   bool fermi_rebind;
 
    /* Used for meta save/restore */
    VkDeviceAddressRangeKHR vb0;
@@ -458,6 +492,13 @@ void nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
                                 uint32_t groupCountX,
                                 uint32_t groupCountY,
                                 uint32_t groupCountZ);
+
+/* Fermi (3D class below a097): copies go through M2MF and through nouveau's
+ * copy-engine firmware, which has its own method layout.
+ */
+bool nvk_cmd_buffer_is_fermi(struct nvk_cmd_buffer *cmd);
+void nvk_cmd_m2mf_copy_linear(struct nvk_cmd_buffer *cmd, uint64_t dst_addr,
+                              uint64_t src_addr, uint64_t size);
 
 void nvk_cmd_fill_memory_ce(struct nvk_cmd_buffer *cmd,
                             uint64_t dst_addr, uint64_t size,

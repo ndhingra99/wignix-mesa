@@ -83,9 +83,38 @@ struct nvk_cbuf {
 PRAGMA_DIAGNOSTIC_POP
 static_assert(sizeof(struct nvk_cbuf) == 8, "This struct has no holes");
 
+/* Before Kepler a texture instruction names the unit its texture is bound
+ * to and the unit its sampler is bound to.  The shader records which
+ * descriptor each unit it uses stands for; the units are bound from the
+ * descriptor sets at draw time.
+ */
+#define NVK_MAX_TEX_UNITS     32
+#define NVK_MAX_SAMPLER_UNITS 16
+
+enum ENUM_PACKED nvk_tex_unit_type {
+   NVK_TEX_UNIT_TYPE_INVALID = 0,
+   /* a struct nvk_sampled_image_descriptor at desc_offset in desc_set */
+   NVK_TEX_UNIT_TYPE_DESC,
+   /* sampler units only: the device's sampler for texel fetches, index 0 */
+   NVK_TEX_UNIT_TYPE_TXF_SAMPLER,
+};
+
+struct nvk_tex_unit {
+   enum nvk_tex_unit_type type;
+   uint8_t desc_set;
+   uint16_t _pad;
+   uint32_t desc_offset;
+};
+static_assert(sizeof(struct nvk_tex_unit) == 8, "This struct has no holes");
+
 struct nvk_cbuf_map {
    uint32_t cbuf_count;
    struct nvk_cbuf cbufs[16];
+
+   uint16_t tex_unit_count;
+   uint16_t sampler_unit_count;
+   struct nvk_tex_unit tex_units[NVK_MAX_TEX_UNITS];
+   struct nvk_tex_unit sampler_units[NVK_MAX_SAMPLER_UNITS];
 };
 
 uint16_t

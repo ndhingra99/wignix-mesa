@@ -28,6 +28,43 @@
 #include "nv_push_clc7c0.h"
 #include "nv_push_clc86f.h"
 
+/* Called on Fermi's compute class: launches a grid whose three group counts
+ * are its parameters, so that they can come straight from an indirect
+ * buffer.  A zero count launches nothing.  The macro memory is one for the
+ * 3D and the compute class, so this lives among the 3D macros.
+ */
+void
+nvk_mme_fermi_launch_grid(struct mme_builder *b)
+{
+   if (b->devinfo->cls_compute >= KEPLER_COMPUTE_A)
+      return;
+
+   struct mme_value x = mme_load(b);
+   struct mme_value y = mme_load(b);
+   struct mme_value z = mme_load(b);
+
+   mme_if(b, ine, x, mme_zero()) {
+      mme_if(b, ine, y, mme_zero()) {
+         mme_if(b, ine, z, mme_zero()) {
+            struct mme_value yx = mme_merge(b, x, y, 16, 16, 0);
+            mme_mthd(b, NV90C0_SET_CTA_RASTER_SIZE_A);
+            mme_emit(b, yx);
+            mme_emit(b, z);
+            mme_mthd(b, NV90C0_BEGIN_GRID);
+            mme_emit(b, mme_zero());
+            mme_mthd(b, 0x0a08);
+            mme_emit(b, mme_zero());
+            mme_mthd(b, NV90C0_LAUNCH);
+            mme_emit(b, mme_imm(0x1000));
+            mme_mthd(b, 0x0a04); /* end of grid */
+            mme_emit(b, mme_zero());
+            mme_mthd(b, NV90C0_WAIT_REF_COUNT);
+            mme_emit(b, mme_imm(1));
+         }
+      }
+   }
+}
+
 VkResult
 nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
 {
@@ -42,6 +79,38 @@ nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
 
    if (pdev->info.cls_compute == MAXWELL_COMPUTE_A)
       P_IMMD(p, NVB0C0, SET_SELECT_MAXWELL_TEXTURE_HEADERS, V_TRUE);
+
+   if (pdev->info.cls_compute < KEPLER_COMPUTE_A) {
+      /* Fermi's compute engine is set up by methods, as the GL driver does
+       * it (nvc0_screen_compute_setup): the number of processors, the call
+       * depth, the map from global addresses to virtual ones (identity for
+       * all 256 values of the top byte, read and write), the cache split.
+       */
+      __push_immd(p, SUBC_NV90C0, 0x0758, pdev->info.tpc_count);
+      __push_immd(p, SUBC_NV90C0, 0x0d64, 0xf);
+      __push_mthd(p, SUBC_NV90C0, NV90C0_SET_WORK_DISTRIBUTION);
+      P_INLINE_DATA(p, 0x8000);
+
+      P_IMMD(p, NV90C0, SET_GA_TO_VA_MAPPING_MODE, V_DISABLE);
+      P_0INC(p, NV90C0, LOAD_GA_TO_VA_MAPPING_ENTRY);
+      for (uint32_t i = 0; i <= 0xff; i++)
+         P_INLINE_DATA(p, (0xc << 28) | (i << 16) | i);
+      P_IMMD(p, NV90C0, SET_GA_TO_VA_MAPPING_MODE, V_ENABLE);
+
+      __push_immd(p, SUBC_NV90C0, NV90C0_SET_L1_CONFIGURATION,
+         NV90C0_SET_L1_CONFIGURATION_DIRECTLY_ADDRESSABLE_MEMORY_SIZE_48KB);
+      __push_immd(p, SUBC_NV90C0, NV90C0_SET_SHADER_SHARED_MEMORY_SIZE, 0);
+
+      /* How many bound units the shaders can reach: 16 samplers and 32
+       * texture headers (NVK_MAX_SAMPLER_UNITS, NVK_MAX_TEX_UNITS), the GL
+       * driver's TEX_LIMITS value.  Without it units from 4 on read as
+       * unbound.
+       */
+      P_IMMD(p, NV90C0, SET_BINDING_CONTROL_TEXTURE, {
+         .max_active_samplers = MAX_ACTIVE_SAMPLERS__16,
+         .max_active_headers = MAX_ACTIVE_HEADERS__32,
+      });
+   }
 
    if (pdev->info.cls_compute < VOLTA_COMPUTE_A) {
       uint64_t shader_base_addr =
@@ -263,6 +332,210 @@ nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
                              qmd_addr_out, root_desc_addr_out);
 }
 
+/* A dispatch on Fermi (compute class 90c0).  There is no launch descriptor:
+ * the constant buffers, the texture and sampler units, the program and the
+ * sizes are set by methods and LAUNCH starts the grid, following the GL
+ * driver (nvc0_launch_grid).  Constant buffer and texture bindings of the
+ * compute engine are shared with the 3D engine's, so the 3D ones are marked
+ * for rebinding.
+ */
+static void
+nvk_cmd_dispatch_fermi(struct nvk_cmd_buffer *cmd,
+                       const struct nvk_shader *shader,
+                       const struct nvk_descriptor_state *desc,
+                       const void *root, size_t root_size,
+                       const uint32_t group_count[3],
+                       bool indirect, uint64_t indirect_addr)
+{
+   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+
+   if (shader == NULL)
+      return;
+
+   if (!indirect &&
+       (group_count[0] == 0 || group_count[1] == 0 || group_count[2] == 0))
+      return;
+
+   /* The engine wants a local memory area even for a shader that uses
+    * none: every launch declares a call stack of 0x800 bytes per warp.
+    */
+   nvk_device_ensure_slm(dev, shader->info.slm_size,
+                         MAX2(shader->info.crs_size, 0x800) * 4);
+
+   /* Fermi compute shaders use no constant buffers (nvk_lower_nir): the
+    * compute root table has one fixed place in memory, written here before
+    * every launch and read by address.
+    */
+   assert(root_size <= dev->fermi_cs_root->size_B);
+   assert(root_size % 4 == 0);
+   const uint64_t root_desc_addr = dev->fermi_cs_root->va->addr;
+   const uint32_t *root_dw = root;
+
+   const struct nvk_cbuf_map *map = &shader->cbuf_map;
+   struct nv_push *p;
+
+   /* Written through the 3D class, as the indirect dispatch macro writes
+    * its counts.  Any constant buffer method of the compute class (select,
+    * load or bind) makes 3D shaders read the compute buffer in place of
+    * their own root table afterwards (tests/vkdawn.c Z9).
+    */
+   p = nvk_cmd_buffer_push(cmd, 4);
+   P_MTHD(p, NV9097, SET_CONSTANT_BUFFER_SELECTOR_A);
+   P_NV9097_SET_CONSTANT_BUFFER_SELECTOR_A(p, root_size);
+   P_NV9097_SET_CONSTANT_BUFFER_SELECTOR_B(p, root_desc_addr >> 32);
+   P_NV9097_SET_CONSTANT_BUFFER_SELECTOR_C(p, root_desc_addr);
+   for (uint32_t dw = 0; dw < root_size / 4; dw += 256) {
+      const uint32_t len_dw = MIN2(root_size / 4 - dw, 256);
+      p = nvk_cmd_buffer_push(cmd, 2 + len_dw);
+      P_1INC(p, NV9097, LOAD_CONSTANT_BUFFER_OFFSET);
+      P_NV9097_LOAD_CONSTANT_BUFFER_OFFSET(p, dw * 4);
+      P_INLINE_ARRAY(p, &root_dw[dw], len_dw);
+   }
+
+   if (indirect) {
+      /* the 3D engine's macro writes the counts into the root table and
+       * counts the invocations
+       */
+      p = nvk_cmd_buffer_push(cmd, 5);
+      /* Stall the command streamer */
+      __push_immd(p, SUBC_NV9097, NV906F_SET_REFERENCE, 0);
+      P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DISPATCH_INDIRECT));
+      nv_push_update_count(p, sizeof(VkDispatchIndirectCommand) / 4);
+      nvk_cmd_buffer_push_indirect(cmd, indirect_addr,
+                                   sizeof(VkDispatchIndirectCommand));
+      p = nvk_cmd_buffer_push(cmd, 3);
+      P_INLINE_DATA(p, root_desc_addr >> 32);
+      P_INLINE_DATA(p, root_desc_addr);
+      P_INLINE_DATA(p, shader->info.cs.local_size[0] *
+                       shader->info.cs.local_size[1] *
+                       shader->info.cs.local_size[2]);
+   }
+
+   /* no constant buffers: the shader reads the root table and everything
+    * it points to from memory (nvk_lower_nir)
+    */
+   assert(map->cbuf_count == 0);
+
+   if (map->tex_unit_count > 0 || map->sampler_unit_count > 0) {
+      p = nvk_cmd_buffer_push(cmd, 2 * (map->tex_unit_count +
+                                        map->sampler_unit_count));
+      for (uint32_t i = 0; i < map->tex_unit_count; i++) {
+         const struct nvk_sampled_image_descriptor *d = desc == NULL ? NULL :
+            nvk_cmd_buffer_get_tex_unit_desc(desc, &map->tex_units[i]);
+
+         P_IMMD(p, NV90C0, BIND_TEXTURE_HEADER, {
+            .valid = d != NULL,
+            .texture_slot = i,
+            .index = d != NULL ? d->image_index : 0,
+         });
+      }
+      for (uint32_t i = 0; i < map->sampler_unit_count; i++) {
+         const struct nvk_tex_unit *unit = &map->sampler_units[i];
+         const struct nvk_sampled_image_descriptor *d = desc == NULL ? NULL :
+            nvk_cmd_buffer_get_tex_unit_desc(desc, unit);
+
+         P_IMMD(p, NV90C0, BIND_TEXTURE_SAMPLER, {
+            .valid = d != NULL || unit->type == NVK_TEX_UNIT_TYPE_TXF_SAMPLER,
+            .sampler_slot = i,
+            .index = d != NULL ? d->sampler_index : 0,
+         });
+      }
+   }
+
+   const uint32_t threads = shader->info.cs.local_size[0] *
+                            shader->info.cs.local_size[1] *
+                            shader->info.cs.local_size[2];
+
+   p = nvk_cmd_buffer_push(cmd, 42);
+
+   /* Internal shaders (no descriptor state) don't want conditional
+    * rendering
+    */
+   if (desc == NULL)
+      P_IMMD(p, NVA0C0, SET_RENDER_ENABLE_OVERRIDE, MODE_ALWAYS_RENDER);
+
+   /* the engine keeps its own copy of the code it has run */
+   __push_mthd(p, SUBC_NV90C0, 0x1698); /* FLUSH: code */
+   P_INLINE_DATA(p, 0x1);
+   P_MTHD(p, NV90C0, SET_CTA_PROGRAM_START);
+   P_INLINE_DATA(p, shader->hdr_addr);
+
+   P_MTHD(p, NV90C0, SET_SHADER_LOCAL_MEMORY_LOW_SIZE);
+   P_INLINE_DATA(p, align(shader->info.slm_size, 0x10));
+   P_INLINE_DATA(p, 0);
+   P_INLINE_DATA(p, 0x800);
+
+   P_MTHD(p, NV90C0, SET_SHADER_SHARED_MEMORY_SIZE);
+   P_INLINE_DATA(p, align(shader->info.cs.smem_size, 0x100));
+   P_INLINE_DATA(p, threads);
+   P_INLINE_DATA(p, shader->info.num_control_barriers);
+   P_MTHD(p, NV90C0, SET_CTA_REGISTER_COUNT);
+   P_INLINE_DATA(p, shader->info.num_gprs);
+
+   __push_mthd(p, SUBC_NV90C0, 0x0780); /* grid id */
+   P_INLINE_DATA(p, 1);
+   P_MTHD(p, NV90C0, SET_LAUNCH_ID);
+   P_INLINE_DATA(p, 0);
+   __push_mthd(p, SUBC_NV90C0, 0x1698); /* FLUSH: global memory */
+   P_INLINE_DATA(p, 0x110);
+
+   P_MTHD(p, NV90C0, SET_CTA_THREAD_DIMENSION_A);
+   P_INLINE_DATA(p, (shader->info.cs.local_size[1] << 16) |
+                    shader->info.cs.local_size[0]);
+   P_INLINE_DATA(p, shader->info.cs.local_size[2]);
+
+   if (indirect) {
+      /* the compute engine's macro launches with the counts as they are
+       * in the buffer
+       */
+      __push_immd(p, SUBC_NV90C0, NV906F_SET_REFERENCE, 0);
+      P_1INC(p, NV90C0, CALL_MME_MACRO(NVK_MME_FERMI_LAUNCH_GRID));
+      nv_push_update_count(p, sizeof(VkDispatchIndirectCommand) / 4);
+      nvk_cmd_buffer_push_indirect(cmd, indirect_addr,
+                                   sizeof(VkDispatchIndirectCommand));
+      p = nvk_cmd_buffer_push(cmd, 2);
+   } else {
+      P_MTHD(p, NV90C0, SET_CTA_RASTER_SIZE_A);
+      P_INLINE_DATA(p, (group_count[1] << 16) | group_count[0]);
+      P_INLINE_DATA(p, group_count[2]);
+
+      P_MTHD(p, NV90C0, BEGIN_GRID);
+      P_INLINE_DATA(p, 0);
+      __push_mthd(p, SUBC_NV90C0, 0x0a08);
+      P_INLINE_DATA(p, 0);
+      P_MTHD(p, NV90C0, LAUNCH);
+      P_INLINE_DATA(p, 0x1000);
+      __push_mthd(p, SUBC_NV90C0, 0x0a04); /* end of grid */
+      P_INLINE_DATA(p, 0);
+      P_MTHD(p, NV90C0, WAIT_REF_COUNT);
+      P_INLINE_DATA(p, 0x1);
+   }
+
+   if (desc == NULL)
+      P_IMMD(p, NVA0C0, SET_RENDER_ENABLE_OVERRIDE, MODE_USE_RENDER_ENABLE);
+
+   for (uint32_t g = 0; g < ARRAY_SIZE(cmd->state.gfx.cbuf_groups); g++) {
+      struct nvk_cbuf_group *group = &cmd->state.gfx.cbuf_groups[g];
+      group->dirty |= BITFIELD_MASK(ARRAY_SIZE(group->cbufs));
+   }
+
+   /* The constant buffer selector is shared too, and root descriptor and
+    * draw parameter writes go through it into the 3D root table: point it
+    * back there, with the method filter off so that the write is not
+    * dropped for repeating the 3D class's last value.  The next draw binds
+    * the 3D constant buffers and texture units again the same way
+    * (nvk_cmd_flush_gfx_state).
+    */
+   p = nvk_cmd_buffer_push(cmd, 6);
+   P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_TRACK);
+   P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SELECT_CB0));
+   P_INLINE_DATA(p, 0);
+   P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL,
+          MODE_METHOD_TRACK_WITH_FILTER);
+   cmd->state.gfx.fermi_rebind = true;
+}
+
 static void
 nvk_build_mme_add_cs_invocations(struct mme_builder *b,
                                  struct mme_value64 count)
@@ -305,6 +578,28 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
    uint32_t base_workgroup[3] = { baseGroupX, baseGroupY, baseGroupZ };
    uint32_t global_size[3] = { groupCountX, groupCountY, groupCountZ };
    nvk_flush_compute_state(cmd, base_workgroup, global_size);
+
+   if (nvk_cmd_buffer_compute_cls(cmd) < KEPLER_COMPUTE_A) {
+      const struct nvk_descriptor_state *desc = &cmd->state.cs.descriptors;
+      nvk_cmd_dispatch_fermi(cmd, cmd->state.cs.shader, desc,
+                             desc->root, sizeof(desc->root), global_size,
+                             false, 0);
+
+      /* Only counted if we have a compute shader invocations query */
+      if (cmd->state.cs.active_compute_invocations_query ||
+          cmd->state.inherited_pipeline_statistics &
+             VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT) {
+         const uint64_t cs_invocations =
+            (uint64_t)nvk_compute_local_size(cmd) * (uint64_t)groupCountX *
+            (uint64_t)groupCountY * (uint64_t)groupCountZ;
+
+         struct nv_push *p = nvk_cmd_buffer_push(cmd, 3);
+         P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS));
+         P_INLINE_DATA(p, cs_invocations >> 32);
+         P_INLINE_DATA(p, cs_invocations);
+      }
+      return;
+   }
 
    uint64_t qmd_addr = 0;
    VkResult result = nvk_cmd_flush_cs_qmd(cmd, &cmd->state, global_size,
@@ -359,6 +654,12 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
 
    uint32_t group_count[3] = { groupCountX, groupCountY, groupCountZ };
+
+   if (nvk_cmd_buffer_compute_cls(cmd) < KEPLER_COMPUTE_A) {
+      nvk_cmd_dispatch_fermi(cmd, shader, NULL, root, root_size, group_count,
+                             false, 0);
+      return;
+   }
 
    uint64_t qmd_addr;
    VkResult result = nvk_cmd_upload_qmd(cmd, shader, NULL,
@@ -507,6 +808,34 @@ mme_store_qmd_dispatch_size(struct mme_builder *b,
 void
 nvk_mme_dispatch_indirect(struct mme_builder *b)
 {
+   /* Fermi's compute class launches through methods, not through a launch
+    * descriptor: here the group counts only go to the root table and to
+    * the invocation counter; nvk_mme_fermi_launch_grid launches.
+    */
+   if (b->devinfo->cls_compute < KEPLER_COMPUTE_A) {
+      struct mme_value group_count_x = mme_load(b);
+      struct mme_value group_count_y = mme_load(b);
+      struct mme_value group_count_z = mme_load(b);
+
+      struct mme_value64 root_desc_addr = mme_load_addr64(b);
+      mme_store_root_desc_group_count(b, root_desc_addr,
+                                      group_count_x,
+                                      group_count_y,
+                                      group_count_z);
+
+      /* Y and Z are 16b, so this cant't overflow */
+      struct mme_value cs1 =
+         mme_mul_32x32_32_free_srcs(b, group_count_y, group_count_z);
+      struct mme_value64 cs2 =
+         mme_umul_32x32_64_free_srcs(b, group_count_x, cs1);
+      struct mme_value local_size = mme_load(b);
+      struct mme_value64 count =
+         mme_umul_32x64_64_free_srcs(b, local_size, cs2);
+
+      nvk_build_mme_add_cs_invocations(b, count);
+      return;
+   }
+
    if (b->devinfo->cls_eng3d >= TURING_A) {
       /* Load everything before we switch to an indirect read */
       struct mme_value64 dispatch_addr = mme_load_addr64(b);
@@ -578,6 +907,18 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
 
    uint64_t dispatch_addr = pInfo->addressRange.address;
+
+   if (nvk_cmd_buffer_compute_cls(cmd) < KEPLER_COMPUTE_A) {
+      /* the counts reach the root table and the launch through macros */
+      uint32_t zero[3] = { 0, 0, 0 };
+      nvk_flush_compute_state(cmd, zero, zero);
+
+      const struct nvk_descriptor_state *desc = &cmd->state.cs.descriptors;
+      nvk_cmd_dispatch_fermi(cmd, cmd->state.cs.shader, desc,
+                             desc->root, sizeof(desc->root), zero,
+                             true, dispatch_addr);
+      return;
+   }
 
    /* We set these through the MME */
    uint32_t base_workgroup[3] = { 0, 0, 0 };

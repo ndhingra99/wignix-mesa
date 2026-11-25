@@ -1744,15 +1744,23 @@ impl SM20Op for OpTex {
 
         match self.tex {
             TexRef::Bound(idx) => {
-                e.set_field(32..40, idx);
+                // texture unit, and the sampler unit above it
+                e.set_field(32..40, idx & 0xff);
+                e.set_field(40..44, idx >> 8);
                 e.set_bit(50, false); // .b
             }
             TexRef::CBuf { .. } => {
                 panic!("SM20 doesn't have CBuf textures");
             }
             TexRef::Bindless => {
-                assert!(e.sm.sm() >= 30);
-                e.set_field(32..40, 0xff_u8);
+                if e.sm.sm() >= 30 {
+                    e.set_field(32..40, 0xff_u8);
+                } else {
+                    // Fermi: texture and sampler unit come from the first
+                    // source register (0xttxsaaaa) and these fields are
+                    // ignored
+                    e.set_field(32..44, 0_u16);
+                }
                 e.set_bit(50, true); // .b
             }
         }
@@ -1783,15 +1791,23 @@ impl SM20Op for OpTld {
 
         match self.tex {
             TexRef::Bound(idx) => {
-                e.set_field(32..40, idx);
+                // texture unit, and the sampler unit above it
+                e.set_field(32..40, idx & 0xff);
+                e.set_field(40..44, idx >> 8);
                 e.set_bit(50, false); // .b
             }
             TexRef::CBuf { .. } => {
                 panic!("SM20 doesn't have CBuf textures");
             }
             TexRef::Bindless => {
-                assert!(e.sm.sm() >= 30);
-                e.set_field(32..40, 0xff_u8);
+                if e.sm.sm() >= 30 {
+                    e.set_field(32..40, 0xff_u8);
+                } else {
+                    // Fermi: texture and sampler unit come from the first
+                    // source register (0xttxsaaaa) and these fields are
+                    // ignored
+                    e.set_field(32..44, 0_u16);
+                }
                 e.set_bit(50, true); // .b
             }
         }
@@ -1829,15 +1845,23 @@ impl SM20Op for OpTld4 {
 
         match self.tex {
             TexRef::Bound(idx) => {
-                e.set_field(32..40, idx);
+                // texture unit, and the sampler unit above it
+                e.set_field(32..40, idx & 0xff);
+                e.set_field(40..44, idx >> 8);
                 e.set_bit(50, false); // .b
             }
             TexRef::CBuf { .. } => {
                 panic!("SM20 doesn't have CBuf textures");
             }
             TexRef::Bindless => {
-                assert!(e.sm.sm() >= 30);
-                e.set_field(32..40, 0xff_u8);
+                if e.sm.sm() >= 30 {
+                    e.set_field(32..40, 0xff_u8);
+                } else {
+                    // Fermi: texture and sampler unit come from the first
+                    // source register (0xttxsaaaa) and these fields are
+                    // ignored
+                    e.set_field(32..44, 0_u16);
+                }
                 e.set_bit(50, true); // .b
             }
         }
@@ -1875,15 +1899,23 @@ impl SM20Op for OpTmml {
 
         match self.tex {
             TexRef::Bound(idx) => {
-                e.set_field(32..40, idx);
+                // texture unit, and the sampler unit above it
+                e.set_field(32..40, idx & 0xff);
+                e.set_field(40..44, idx >> 8);
                 e.set_bit(50, false); // .b
             }
             TexRef::CBuf { .. } => {
                 panic!("SM20 doesn't have CBuf textures");
             }
             TexRef::Bindless => {
-                assert!(e.sm.sm() >= 30);
-                e.set_field(32..40, 0xff_u8);
+                if e.sm.sm() >= 30 {
+                    e.set_field(32..40, 0xff_u8);
+                } else {
+                    // Fermi: texture and sampler unit come from the first
+                    // source register (0xttxsaaaa) and these fields are
+                    // ignored
+                    e.set_field(32..44, 0_u16);
+                }
                 e.set_bit(50, true); // .b
             }
         }
@@ -1910,15 +1942,23 @@ impl SM20Op for OpTxd {
 
         match self.tex {
             TexRef::Bound(idx) => {
-                e.set_field(32..40, idx);
+                // texture unit, and the sampler unit above it
+                e.set_field(32..40, idx & 0xff);
+                e.set_field(40..44, idx >> 8);
                 e.set_bit(50, false); // .b
             }
             TexRef::CBuf { .. } => {
                 panic!("SM20 doesn't have CBuf textures");
             }
             TexRef::Bindless => {
-                assert!(e.sm.sm() >= 30);
-                e.set_field(32..40, 0xff_u8);
+                if e.sm.sm() >= 30 {
+                    e.set_field(32..40, 0xff_u8);
+                } else {
+                    // Fermi: texture and sampler unit come from the first
+                    // source register (0xttxsaaaa) and these fields are
+                    // ignored
+                    e.set_field(32..44, 0_u16);
+                }
                 e.set_bit(50, true); // .b
             }
         }
@@ -1945,15 +1985,23 @@ impl SM20Op for OpTxq {
 
         match self.tex {
             TexRef::Bound(idx) => {
-                e.set_field(32..40, idx);
+                // texture unit, and the sampler unit above it
+                e.set_field(32..40, idx & 0xff);
+                e.set_field(40..44, idx >> 8);
                 e.set_bit(50, false); // .b
             }
             TexRef::CBuf { .. } => {
                 panic!("SM20 doesn't have CBuf textures");
             }
             TexRef::Bindless => {
-                assert!(e.sm.sm() >= 30);
-                e.set_field(32..40, 0xff_u8);
+                if e.sm.sm() >= 30 {
+                    e.set_field(32..40, 0xff_u8);
+                } else {
+                    // Fermi: texture and sampler unit come from the first
+                    // source register (0xttxsaaaa) and these fields are
+                    // ignored
+                    e.set_field(32..44, 0_u16);
+                }
                 e.set_bit(50, true); // .b
             }
         }

@@ -13,6 +13,8 @@
 
 #include "nv_push_cl9039.h"
 #include "nv_push_cl9097.h"
+#include "cla097.h"
+#include "nv_push_cl902d.h"
 #include "nv_push_cl90b5.h"
 #include "nv_push_cla0c0.h"
 #include "cla1c0.h"
@@ -137,7 +139,18 @@ nvk_queue_state_update(struct nvk_queue *queue,
       const uint64_t slm_per_tpc = qs->slm.bytes_per_tpc;
       assert(!(slm_per_tpc & 0x7fff));
 
-      if (queue->engines & NVKMD_ENGINE_COMPUTE) {
+      if ((queue->engines & NVKMD_ENGINE_COMPUTE) &&
+          pdev->info.cls_compute < KEPLER_COMPUTE_A) {
+         /* Fermi: address and size as on the 3D engine; the per-thread
+          * amount is given at each launch
+          */
+         P_MTHD(p, NVA0C0, SET_SHADER_LOCAL_MEMORY_A);
+         P_NVA0C0_SET_SHADER_LOCAL_MEMORY_A(p, slm_addr >> 32);
+         P_NVA0C0_SET_SHADER_LOCAL_MEMORY_B(p, slm_addr);
+         P_INLINE_DATA(p, slm_size >> 32);
+         P_INLINE_DATA(p, slm_size);
+         P_INLINE_DATA(p, 0);
+      } else if (queue->engines & NVKMD_ENGINE_COMPUTE) {
          P_MTHD(p, NVA0C0, SET_SHADER_LOCAL_MEMORY_A);
          P_NVA0C0_SET_SHADER_LOCAL_MEMORY_A(p, slm_addr >> 32);
          P_NVA0C0_SET_SHADER_LOCAL_MEMORY_B(p, slm_addr);
@@ -338,10 +351,29 @@ nvk_queue_init_context_state(struct nvk_queue *queue)
    struct nv_push *p = &push;
 
    /* M2MF state */
-   if (pdev->info.cls_m2mf <= FERMI_MEMORY_TO_MEMORY_FORMAT_A) {
-      /* we absolutely do not support Fermi, but if somebody wants to toy
-       * around with it, this is a must
-       */
+   /* Before Kepler every subchannel has to be told which object it runs;
+    * the 3D and compute ones are set with their initial state.
+    */
+   if (pdev->info.cls_eng3d < KEPLER_A) {
+      if (queue->engines & NVKMD_ENGINE_COPY) {
+         /* class in bits 0..15, engine in 16..20: the first copy engine
+          * is engine 4 on Fermi (gf100_fifo_runl_ctor in the kernel)
+          */
+         __push_mthd(p, SUBC_NV90B5, 0x0000);
+         P_INLINE_DATA(p, pdev->info.cls_copy | (4 << 16));
+      }
+      if (queue->engines & NVKMD_ENGINE_2D) {
+         P_MTHD(p, NV902D, SET_OBJECT);
+         P_NV902D_SET_OBJECT(p, {
+            .class_id = pdev->info.cls_eng2d,
+            .engine_id = 0,
+         });
+      }
+   }
+
+   if ((queue->engines & NVKMD_ENGINE_M2MF) &&
+       pdev->info.cls_m2mf <= FERMI_MEMORY_TO_MEMORY_FORMAT_A) {
+      /* Fermi's M2MF subchannel needs its object set */
       P_MTHD(p, NV9039, SET_OBJECT);
       P_NV9039_SET_OBJECT(p, {
          .class_id = pdev->info.cls_m2mf,
@@ -418,7 +450,8 @@ nvk_queue_create(struct nvk_device *dev,
    nvk_queue_state_init(&queue->state);
 
    queue->engines =
-      nvk_queue_engines_from_queue_flags(queue_family->queue_flags);
+      nvk_queue_engines_from_queue_flags(&pdev->info,
+                                         queue_family->queue_flags);
 
    if (queue->engines) {
       result = nvkmd_dev_create_ctx(dev->nvkmd, &dev->vk.base,

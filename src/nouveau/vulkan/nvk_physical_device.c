@@ -50,6 +50,7 @@
 #include "clc1c0.h"
 #include "clc397.h"
 #include "clc3c0.h"
+#include "cl9097.h"
 #include "clc597.h"
 #include "clc5c0.h"
 #include "clc797.h"
@@ -69,6 +70,12 @@ nvk_get_vk_version(const struct nv_device_info *info)
 #if defined(ANDROID_STRICT) && ANDROID_API_LEVEL <= 32
    return VK_MAKE_VERSION(1, 1, VK_HEADER_VERSION);
 #endif
+
+   /* Fermi: what has been run on the hardware adds up to 1.1
+    * (nvk_fermi_limit_extensions, nvk_fermi_limit_features)
+    */
+   if (info->cls_eng3d < KEPLER_A)
+      return VK_MAKE_VERSION(1, 1, VK_HEADER_VERSION);
 
    /* Vulkan 1.3 requires vulkanMemoryModel which isn't supported by Kepler */
    if (info->cls_eng3d < MAXWELL_A)
@@ -106,6 +113,96 @@ nvk_has_astc(const struct nv_device_info *info)
 {
    /* ASTC only exists on Tegra TK1 and later */
    return info->type == NV_DEVICE_TYPE_SOC && info->cls_eng3d >= KEPLER_C;
+}
+
+/* Fermi offers only what has been run on a GF106 (tests in
+ * ~/Fermi-Vulkan/tests, Dawn and Skia in Chromium) or does not depend on the
+ * hardware generation: what Vulkan 1.1 folds in, render pass, pipeline and
+ * state plumbing that NVK and the common runtime implement the same way for
+ * every chip, window system and external handle support.  Left out is
+ * everything that leans on shader or descriptor abilities never checked on
+ * this shader model: descriptor indexing, robustness2, 16-bit and 64-bit
+ * types, subgroups, variable pointers, device addresses.
+ */
+static void
+nvk_fermi_limit_extensions(struct vk_device_extension_table *ext)
+{
+   const struct vk_device_extension_table all = *ext;
+   *ext = (struct vk_device_extension_table) { };
+
+#define KEEP(e) ext->e = all.e
+   /* part of Vulkan 1.1 */
+   KEEP(KHR_bind_memory2);
+   KEEP(KHR_dedicated_allocation);
+   KEEP(KHR_descriptor_update_template);
+   KEEP(KHR_device_group);
+   KEEP(KHR_external_fence);
+   KEEP(KHR_external_memory);
+   KEEP(KHR_external_semaphore);
+   KEEP(KHR_get_memory_requirements2);
+   KEEP(KHR_maintenance1);
+   KEEP(KHR_maintenance2);
+   KEEP(KHR_maintenance3);
+   KEEP(KHR_multiview);
+   KEEP(KHR_relaxed_block_layout);
+   /* Chromium's Vulkan compositor does not start without it
+    * (vulkan_device_queue.cc); not tested on Fermi
+    */
+   KEEP(KHR_sampler_ycbcr_conversion);
+   KEEP(KHR_shader_draw_parameters);
+   KEEP(KHR_storage_buffer_storage_class);
+
+   /* render passes, pipelines, state, queries, synchronization */
+   KEEP(KHR_copy_commands2);
+   KEEP(KHR_create_renderpass2);
+   KEEP(KHR_depth_stencil_resolve);
+   KEEP(KHR_driver_properties);
+   KEEP(KHR_dynamic_rendering);
+   KEEP(KHR_format_feature_flags2);
+   KEEP(KHR_image_format_list);
+   KEEP(KHR_imageless_framebuffer);
+   KEEP(KHR_load_store_op_none);
+   KEEP(KHR_maintenance4);
+   KEEP(KHR_pipeline_library);
+   KEEP(KHR_push_descriptor);
+   KEEP(KHR_shader_float_controls);
+   KEEP(KHR_shader_non_semantic_info);
+   KEEP(KHR_spirv_1_4);
+   KEEP(KHR_synchronization2);
+   KEEP(KHR_timeline_semaphore);
+   KEEP(KHR_uniform_buffer_standard_layout);
+   KEEP(KHR_calibrated_timestamps);
+   KEEP(EXT_calibrated_timestamps);
+   KEEP(EXT_conditional_rendering);
+   KEEP(EXT_depth_clip_enable);
+   KEEP(EXT_extended_dynamic_state);
+   KEEP(EXT_extended_dynamic_state2);
+   KEEP(EXT_graphics_pipeline_library);
+   KEEP(EXT_host_query_reset);
+   KEEP(EXT_load_store_op_none);
+   KEEP(EXT_pipeline_creation_cache_control);
+   KEEP(EXT_private_data);
+   KEEP(EXT_shader_object);
+   KEEP(EXT_tooling_info);
+   KEEP(EXT_transform_feedback);
+   KEEP(EXT_vertex_input_dynamic_state);
+
+   /* window system, external handles, device identity */
+   KEEP(KHR_external_fence_fd);
+   KEEP(KHR_external_memory_fd);
+   KEEP(KHR_external_semaphore_fd);
+   KEEP(KHR_incremental_present);
+   KEEP(KHR_swapchain);
+   KEEP(KHR_swapchain_maintenance1);
+   KEEP(KHR_swapchain_mutable_format);
+   KEEP(EXT_external_memory_dma_buf);
+   KEEP(EXT_image_drm_format_modifier);
+   KEEP(EXT_memory_budget);
+   KEEP(EXT_pci_bus_info);
+   KEEP(EXT_physical_device_drm);
+   KEEP(EXT_queue_family_foreign);
+   KEEP(EXT_swapchain_maintenance1);
+#undef KEEP
 }
 
 static void
@@ -325,6 +422,95 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
          instance->experimental_flags & NVK_EXPERIMENTAL_DLSS,
       .VALVE_mutable_descriptor_type = true,
    };
+
+   if (info->cls_eng3d < KEPLER_A)
+      nvk_fermi_limit_extensions(ext);
+}
+
+/* The features Fermi offers, chosen as its extensions are
+ * (nvk_fermi_limit_extensions).  Of the Vulkan 1.0 features these are the
+ * ones the tests cover (robust buffer access, cube arrays, independent
+ * blend, geometry and tessellation shaders, sample rate shading, depth bias
+ * clamp, 32-bit indices, stores in every stage, storage image formats,
+ * arrays of descriptors indexed at run time, BC formats) and rasterizer,
+ * blend and draw state the 3D class has had since Fermi and NVK sets the
+ * same way for every chip.  Not offered: 16-bit and 64-bit shader types,
+ * multisampled storage images, precise occlusion queries, anything sparse.
+ */
+static void
+nvk_fermi_limit_features(struct vk_features *features)
+{
+   const struct vk_features all = *features;
+   *features = (struct vk_features) { };
+
+#define KEEP(f) features->f = all.f
+   /* Vulkan 1.0 */
+   KEEP(robustBufferAccess);
+   KEEP(fullDrawIndexUint32);
+   KEEP(imageCubeArray);
+   KEEP(independentBlend);
+   KEEP(geometryShader);
+   KEEP(tessellationShader);
+   KEEP(sampleRateShading);
+   KEEP(dualSrcBlend);
+   KEEP(logicOp);
+   KEEP(multiDrawIndirect);
+   KEEP(drawIndirectFirstInstance);
+   KEEP(depthClamp);
+   KEEP(depthBiasClamp);
+   KEEP(fillModeNonSolid);
+   KEEP(depthBounds);
+   KEEP(wideLines);
+   KEEP(largePoints);
+   KEEP(alphaToOne);
+   KEEP(multiViewport);
+   KEEP(samplerAnisotropy);
+   KEEP(textureCompressionBC);
+   KEEP(pipelineStatisticsQuery);
+   KEEP(vertexPipelineStoresAndAtomics);
+   KEEP(fragmentStoresAndAtomics);
+   KEEP(shaderTessellationAndGeometryPointSize);
+   KEEP(shaderImageGatherExtended);
+   KEEP(shaderStorageImageExtendedFormats);
+   KEEP(shaderUniformBufferArrayDynamicIndexing);
+   KEEP(shaderSampledImageArrayDynamicIndexing);
+   KEEP(shaderStorageBufferArrayDynamicIndexing);
+   KEEP(shaderStorageImageArrayDynamicIndexing);
+   KEEP(shaderClipDistance);
+   KEEP(shaderCullDistance);
+
+   /* Vulkan 1.1 */
+   KEEP(multiview);
+   KEEP(multiviewGeometryShader);
+   KEEP(multiviewTessellationShader);
+   KEEP(shaderDrawParameters);
+   /* required by Chromium's Vulkan compositor; not tested on Fermi */
+   KEEP(samplerYcbcrConversion);
+
+   /* of the extensions kept */
+   KEEP(imagelessFramebuffer);
+   KEEP(uniformBufferStandardLayout);
+   KEEP(timelineSemaphore);
+   KEEP(hostQueryReset);
+   KEEP(dynamicRendering);
+   KEEP(synchronization2);
+   KEEP(maintenance4);
+   KEEP(pipelineCreationCacheControl);
+   KEEP(privateData);
+   KEEP(extendedDynamicState);
+   KEEP(extendedDynamicState2);
+   KEEP(extendedDynamicState2LogicOp);
+   KEEP(extendedDynamicState2PatchControlPoints);
+   KEEP(vertexInputDynamicState);
+   KEEP(graphicsPipelineLibrary);
+   KEEP(transformFeedback);
+   KEEP(geometryStreams);
+   KEEP(conditionalRendering);
+   KEEP(inheritedConditionalRendering);
+   KEEP(depthClipEnable);
+   KEEP(shaderObject);
+   KEEP(swapchainMaintenance1);
+#undef KEEP
 }
 
 static void
@@ -369,7 +555,8 @@ nvk_get_device_features(const struct nv_device_info *info,
       .shaderStorageImageExtendedFormats = true,
       .shaderStorageImageMultisample = true,
       .shaderStorageImageReadWithoutFormat = info->cls_eng3d >= MAXWELL_A,
-      .shaderStorageImageWriteWithoutFormat = true,
+      /* Fermi converts and stores in the shader, which needs the format */
+      .shaderStorageImageWriteWithoutFormat = info->cls_eng3d >= 0xa097,
       .shaderUniformBufferArrayDynamicIndexing = true,
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
@@ -816,6 +1003,9 @@ nvk_get_device_features(const struct nv_device_info *info,
       .shaderFmaFloat32 = true,
       .shaderFmaFloat64 = true,
    };
+
+   if (info->cls_eng3d < KEPLER_A)
+      nvk_fermi_limit_features(features);
 }
 
 static void
@@ -910,7 +1100,9 @@ nvk_get_device_properties(const struct nvk_instance *instance,
          NVK_MAX_SHARED_SIZE,
          info->sm_smem_sizes_kB[info->sm_smem_size_count - 1] * 1024
       ),
-      .maxComputeWorkGroupCount = {0x7fffffff, 65535, 65535},
+      /* Fermi's launch methods take 16 bits for each of x and y */
+      .maxComputeWorkGroupCount = {
+         info->cls_compute < 0xa0c0 ? 65535 : 0x7fffffff, 65535, 65535},
       .maxComputeWorkGroupInvocations = 1024,
       .maxComputeWorkGroupSize = {1024, 1024, 64},
       .subPixelPrecisionBits = 8,
@@ -1395,6 +1587,24 @@ nvk_get_device_properties(const struct nvk_instance *instance,
    snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "NVK");
    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
+
+   if (info->cls_eng3d < KEPLER_A) {
+      /* Fermi has no texture handles: a shader stage reaches the textures
+       * and samplers bound to its units, 32 and 16 of them
+       * (SET_BINDING_CONTROL_TEXTURE).  Input attachments are textures too.
+       * Buffers and storage images are read by address and have no such
+       * limit.  A stage that uses all 16 samplers has none left for the one
+       * texelFetch needs.
+       */
+      properties->maxPerStageDescriptorSamplers = NVK_MAX_SAMPLER_UNITS;
+      properties->maxPerStageDescriptorSampledImages = NVK_MAX_TEX_UNITS;
+      properties->maxPerStageDescriptorInputAttachments = NVK_MAX_RTS;
+      properties->maxDescriptorSetSamplers = 5 * NVK_MAX_SAMPLER_UNITS;
+      properties->maxDescriptorSetSampledImages = 5 * NVK_MAX_TEX_UNITS;
+      properties->maxDescriptorSetInputAttachments = NVK_MAX_RTS;
+      properties->maxFragmentCombinedOutputResources =
+         NVK_MAX_RTS + NVK_MAX_TEX_UNITS + 2 * NVK_MAX_DESCRIPTORS;
+   }
 }
 
 static void
@@ -1499,13 +1709,18 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
    if (result != VK_SUCCESS)
       return result;
 
-   /* We don't support anything pre-Kepler */
-   if (nvkmd->dev_info.cls_eng3d < KEPLER_A) {
+   /* Nothing older than Fermi has the classes this driver is built on */
+   if (nvkmd->dev_info.cls_eng3d < FERMI_A) {
       result = VK_ERROR_INCOMPATIBLE_DRIVER;
       goto fail_nvkmd;
    }
 
-   if (!nvk_is_conformant(&nvkmd->dev_info) &&
+   /* The GF106 (the ThinkPad W520's Quadro 2000M) is the one Fermi chip this
+    * has been run on; it is accepted without the override.
+    */
+   const bool is_gf106 = nvkmd->dev_info.chipset == 0xc3;
+
+   if (!nvk_is_conformant(&nvkmd->dev_info) && !is_gf106 &&
        !debug_get_bool_option("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", false)) {
 #ifdef NDEBUG
       result = VK_ERROR_INCOMPATIBLE_DRIVER;
