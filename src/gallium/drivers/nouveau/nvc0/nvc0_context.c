@@ -75,6 +75,8 @@ nvc0_svm_migrate(struct pipe_context *pipe, unsigned num_ptrs,
 }
 
 
+__thread char nvc0_stream_thread;
+
 static void
 nvc0_flush(struct pipe_context *pipe,
            struct pipe_fence_handle **fence,
@@ -83,8 +85,7 @@ nvc0_flush(struct pipe_context *pipe,
    struct nvc0_context *nvc0 = nvc0_context(pipe);
 
    if (fence)
-      nouveau_fence_ref(nvc0->base.fence, (struct nouveau_fence **)fence,
-                        nvc0->base.screen);
+      nouveau_fence_ref_current(&nvc0->base, (struct nouveau_fence **)fence);
 
    nvc0_stream_lock(nvc0);
    PUSH_KICK(nvc0->base.pushbuf); /* fencing handled in kick_notify */
@@ -297,6 +298,7 @@ nvc0_default_kick_notify(struct nouveau_context *context)
    _nouveau_fence_update(context->screen, true);
 
    nvc0->draws_pending = 0;
+   nvc0->base.fence_kick_wanted = false;
    nvc0->state.flushed = true;
    return true;
 }
@@ -418,6 +420,65 @@ static void
 nvc0_context_get_sample_position(struct pipe_context *, unsigned, unsigned,
                                  float *);
 
+/* The threaded context gives a buffer new storage by making a new buffer
+ * and having the old one take over what it holds (queued; this runs on the
+ * context's thread).  The new buffer stays alive and mapped by the
+ * application for as long as it likes, so the bo is shared; the
+ * sub-allocation moves to dst, which outlives src as the user of it.
+ */
+static void
+nvc0_replace_buffer_storage(struct pipe_context *pipe,
+                            struct pipe_resource *pdst,
+                            struct pipe_resource *psrc,
+                            unsigned minimum_num_rebinds,
+                            uint64_t rebind_mask,
+                            uint32_t delete_buffer_id)
+{
+   struct nouveau_context *nv = nouveau_context(pipe);
+   struct nv04_resource *dst = nv04_resource(pdst);
+   struct nv04_resource *src = nv04_resource(psrc);
+   const int ref = pdst->reference.count - 1;
+
+   nouveau_buffer_release_gpu_storage(dst);
+   nouveau_fence_ref(NULL, &dst->fence, nv->screen);
+   nouveau_fence_ref(NULL, &dst->fence_wr, nv->screen);
+   if (dst->data && !(dst->status & NOUVEAU_BUFFER_STATUS_USER_MEMORY)) {
+      align_free(dst->data);
+      dst->data = NULL;
+   }
+   dst->status &= NOUVEAU_BUFFER_STATUS_REALLOC_MASK;
+
+   nouveau_bo_ref(src->bo, &dst->bo);
+   dst->offset = src->offset;
+   dst->address = src->address;
+   dst->domain = src->domain;
+   dst->mm = src->mm;
+   src->mm = NULL;
+   /* A buffer that gets replaced is streamed into: the replacements made
+    * from now on are created where they map directly.
+    */
+   pdst->usage = PIPE_USAGE_STREAM;
+
+   util_range_set_empty(&dst->valid_buffer_range);
+   util_range_add(pdst, &dst->valid_buffer_range,
+                  src->valid_buffer_range.start, src->valid_buffer_range.end);
+
+   if (ref > 0)
+      nv->invalidate_resource_storage(nv, pdst, ref);
+}
+
+/* Called by a thread other than the context's own: wait until that one has
+ * run everything queued and is idle.
+ */
+static void
+nvc0_sync_threaded(struct nouveau_context *nv)
+{
+   struct nvc0_context *nvc0 = nvc0_context(&nv->pipe);
+
+   if (nvc0->tc)
+      threaded_context_unwrap_sync(&nvc0->tc->base);
+}
+
 struct pipe_context *
 nvc0_create(struct pipe_screen *pscreen, void *priv, unsigned ctxflags)
 {
@@ -438,6 +499,7 @@ nvc0_create(struct pipe_screen *pscreen, void *priv, unsigned ctxflags)
    if (nouveau_context_init(&nvc0->base, &screen->base))
       goto out_err;
    nvc0->base.kick_notify = nvc0_default_kick_notify;
+   nvc0->base.fence_kick_deferred = true;
    nvc0->base.pushbuf->rsvd_kick = 5;
 
    ret = nouveau_bufctx_new(nvc0->base.client, 2, &nvc0->bufctx);
@@ -529,12 +591,12 @@ nvc0_create(struct pipe_screen *pscreen, void *priv, unsigned ctxflags)
    /* now that there are no more opportunities for errors, set the current
     * context if there isn't already one.
     */
-   simple_mtx_lock(&screen->state_lock);
+   nvc0_stream_lock(nvc0);
    if (!screen->cur_ctx) {
       nvc0->state = screen->save_state;
       screen->cur_ctx = nvc0;
    }
-   simple_mtx_unlock(&screen->state_lock);
+   nvc0_stream_unlock(nvc0);
 
    nouveau_pushbuf_bufctx(nvc0->base.pushbuf, nvc0->bufctx);
    PUSH_SPACE(nvc0->base.pushbuf, 8);
@@ -586,6 +648,21 @@ nvc0_create(struct pipe_screen *pscreen, void *priv, unsigned ctxflags)
          nvc0->samplers_dirty[s] = 1;
       nvc0->dirty_3d |= NVC0_NEW_3D_SAMPLERS;
       nvc0->dirty_cp |= NVC0_NEW_CP_SAMPLERS;
+   }
+
+   /* The video decoders drive their contexts themselves and never ask for
+    * a thread.
+    */
+   if (screen->threaded && (ctxflags & PIPE_CONTEXT_PREFER_THREADED)) {
+      /* get_device_reset_status touches nothing */
+      const struct threaded_context_options options = {
+         .unsynchronized_get_device_reset_status = true,
+      };
+
+      nvc0->base.sync_threaded = nvc0_sync_threaded;
+      return threaded_context_create(pipe, &screen->transfer_pool,
+                                     nvc0_replace_buffer_storage, &options,
+                                     &nvc0->tc);
    }
 
    return pipe;

@@ -23,6 +23,18 @@ struct nouveau_context {
 
    bool vbo_dirty;
 
+   /* A fence with much work queued wants closing.  With fence_kick_deferred
+    * the context does that itself when it next can (fence_kick_wanted),
+    * instead of whichever thread queued the work submitting the pushbuf.
+    */
+   bool fence_kick_deferred;
+   bool fence_kick_wanted;
+
+   /* Waits until the thread that normally drives this context is idle and
+    * hands the context to the caller; set when the context is threaded.
+    */
+   void (*sync_threaded)(struct nouveau_context *);
+
    void (*copy_data)(struct nouveau_context *,
                      struct nouveau_bo *dst, unsigned, unsigned,
                      struct nouveau_bo *src, unsigned, unsigned, unsigned);

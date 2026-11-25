@@ -184,8 +184,8 @@ struct nvc0_context {
 
    struct nvc0_screen *screen;
 
-   unsigned stream_depth;  /* nesting of nvc0_stream_lock on this context */
    unsigned draws_pending; /* draws written since the last submit */
+   struct threaded_context *tc; /* set when the context is threaded */
 
    void (*m2mf_copy_rect)(struct nvc0_context *,
                           const struct nv50_m2mf_rect *dst,
@@ -331,22 +331,19 @@ nvc0_context(struct pipe_context *pipe)
 MUST_CHECK bool nvc0_default_kick_notify(struct nouveau_context *);
 MUST_CHECK bool nvc0_draw_vbo_kick_notify(struct nouveau_context *);
 
-/* Take the screen's command stream for this context without claiming the
- * hardware: enough for submitting the context's own pushbuf.
+/* Take the screen's command stream without claiming the hardware: enough
+ * for submitting the context's own pushbuf and for the screen's tables.
  */
 static inline void
 nvc0_stream_lock(struct nvc0_context *nvc0)
 {
-   if (!nvc0->stream_depth++)
-      simple_mtx_lock(&nvc0->screen->state_lock);
+   nvc0_screen_stream_lock(nvc0->screen);
 }
 
 static inline void
 nvc0_stream_unlock(struct nvc0_context *nvc0)
 {
-   assert(nvc0->stream_depth);
-   if (!--nvc0->stream_depth)
-      simple_mtx_unlock(&nvc0->screen->state_lock);
+   nvc0_screen_stream_unlock(nvc0->screen);
 }
 
 /* Bracket for everything that writes commands.  The first context to write

@@ -1180,6 +1180,10 @@ nvc0_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
 
    nvc0->base.kick_notify = nvc0_default_kick_notify;
 
+   /* a fence with much work queued: close it */
+   if (unlikely(nvc0->base.fence_kick_wanted))
+      PUSH_KICK(push);
+
    nvc0_release_user_vbufs(nvc0);
 
    nouveau_pushbuf_bufctx(push, NULL);

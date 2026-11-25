@@ -6,6 +6,9 @@
 #include "nouveau_fence.h"
 #include "nouveau_heap.h"
 
+#include "util/slab.h"
+#include "util/u_atomic.h"
+
 #include "nv_object.xml.h"
 
 #include "nvc0/nvc0_winsys.h"
@@ -70,14 +73,19 @@ struct nvc0_screen {
    struct nvc0_context *cur_ctx;
    struct nvc0_graph_state save_state;
    /* The channel and its hardware state are shared by all contexts of the
-    * screen.  A context holds state_lock while it writes commands to its
-    * pushbuf or submits it.  stream_ctx is the context whose commands are
+    * screen.  A thread holds state_lock while it writes commands to a
+    * pushbuf or submits one.  stream_ctx is the context whose commands are
     * not submitted yet; another context submits them before it writes its
     * own (nvc0_stream_begin), so the channel sees whole runs of one context.
     */
    simple_mtx_t state_lock;
+   uintptr_t stream_owner; /* thread holding state_lock, for re-entry */
+   unsigned stream_depth;
    struct nvc0_context *stream_ctx;
    unsigned kick_draws; /* submit after this many draws, 0 = only when asked */
+
+   bool threaded; /* contexts run their driver calls in a thread of their own */
+   struct slab_parent_pool transfer_pool;
 
    int num_occlusion_queries_active;
 
@@ -189,38 +197,76 @@ struct nvc0_vertex_format {
 extern const struct nvc0_format nvc0_format_table[];
 extern const struct nvc0_vertex_format nvc0_vertex_format[];
 
+/* Its address identifies the calling thread. */
+extern __thread char nvc0_stream_thread;
+
+/* state_lock, re-entrant for the thread that holds it. */
+static inline void
+nvc0_screen_stream_lock(struct nvc0_screen *screen)
+{
+   const uintptr_t self = (uintptr_t)&nvc0_stream_thread;
+
+   if (p_atomic_read(&screen->stream_owner) != self) {
+      simple_mtx_lock(&screen->state_lock);
+      p_atomic_set(&screen->stream_owner, self);
+   }
+   screen->stream_depth++;
+}
+
+static inline void
+nvc0_screen_stream_unlock(struct nvc0_screen *screen)
+{
+   assert(screen->stream_depth);
+   if (!--screen->stream_depth) {
+      p_atomic_set(&screen->stream_owner, 0);
+      simple_mtx_unlock(&screen->state_lock);
+   }
+}
+
+/* The TIC and TSC tables belong to the screen; views and samplers are
+ * unbound and destroyed by any context, on any thread, and an entry can be
+ * evicted (id = -1) by another context's allocation.
+ */
 static inline void
 nvc0_screen_tic_unlock(struct nvc0_screen *screen, struct nv50_tic_entry *tic)
 {
    if (tic->bindless)
       return;
+   nvc0_screen_stream_lock(screen);
    if (tic->id >= 0)
       screen->tic.lock[tic->id / 32] &= ~(1 << (tic->id % 32));
+   nvc0_screen_stream_unlock(screen);
 }
 
 static inline void
 nvc0_screen_tsc_unlock(struct nvc0_screen *screen, struct nv50_tsc_entry *tsc)
 {
+   nvc0_screen_stream_lock(screen);
    if (tsc->id >= 0)
       screen->tsc.lock[tsc->id / 32] &= ~(1 << (tsc->id % 32));
+   nvc0_screen_stream_unlock(screen);
 }
 
 static inline void
 nvc0_screen_tic_free(struct nvc0_screen *screen, struct nv50_tic_entry *tic)
 {
+   nvc0_screen_stream_lock(screen);
    if (tic->id >= 0) {
       screen->tic.entries[tic->id] = NULL;
       screen->tic.lock[tic->id / 32] &= ~(1 << (tic->id % 32));
    }
+   nvc0_screen_stream_unlock(screen);
 }
 
 static inline void
 nvc0_screen_tsc_free(struct nvc0_screen *screen, struct nv50_tsc_entry *tsc)
 {
+   nvc0_screen_stream_lock(screen);
    if (tsc->id >= 0) {
       screen->tsc.entries[tsc->id] = NULL;
       screen->tsc.lock[tsc->id / 32] &= ~(1 << (tsc->id % 32));
    }
+   nvc0_screen_stream_unlock(screen);
 }
 
 #endif

@@ -38,6 +38,7 @@ struct nvc0_constbuf {
       const void *data;
    } u;
    uint32_t size;
+   uint32_t bytes; /* of a buffer binding: its size before rounding up */
    uint32_t offset;
    bool user; /* should only be true if u.data is valid and non-NULL */
 };

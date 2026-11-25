@@ -284,7 +284,9 @@ nvc0_init_screen_caps(struct nvc0_screen *screen)
    caps->quads_follow_provoking_vertex_convention = true;
    caps->start_instance = true;
    caps->draw_indirect = true;
-   caps->user_vertex_buffers = true;
+   /* a threaded context takes neither user vertex arrays nor user constants */
+   caps->user_vertex_buffers = !screen->threaded;
+   caps->prefer_real_buffer_in_constbuf0 = screen->threaded;
    caps->texture_query_lod = true;
    caps->sample_shading = true;
    caps->texture_gather_offsets = true;
@@ -461,6 +463,7 @@ nvc0_screen_destroy(struct pipe_screen *pscreen)
 
    nouveau_screen_fini(&screen->base);
    simple_mtx_destroy(&screen->state_lock);
+   slab_destroy_parent(&screen->transfer_pool);
 
    FREE(screen);
 }
@@ -602,6 +605,29 @@ nvc0_screen_fence_update(struct pipe_screen *pscreen)
 {
    struct nvc0_screen *screen = nvc0_screen(pscreen);
    return screen->fence.map[0];
+}
+
+/* A thread waits for a fence that is not submitted yet.  Emitting it and
+ * submitting write to the fence's context, so they happen under the stream
+ * lock.  Unless this is that context's own thread in the middle of its
+ * commands, the context's buffer lists are left to its thread.
+ */
+static bool
+nvc0_screen_fence_flush(struct nouveau_fence *fence)
+{
+   struct nvc0_screen *screen = nvc0_screen(&fence->screen->base);
+   const bool own =
+      p_atomic_read(&screen->stream_owner) == (uintptr_t)&nvc0_stream_thread &&
+      screen->stream_ctx == nvc0_context(&fence->context->pipe);
+   bool ret;
+
+   nvc0_screen_stream_lock(screen);
+   simple_mtx_lock(&screen->base.fence.lock);
+   ret = _nouveau_fence_kick(fence, !own);
+   simple_mtx_unlock(&screen->base.fence.lock);
+   nvc0_screen_stream_unlock(screen);
+
+   return ret;
 }
 
 static int
@@ -802,6 +828,9 @@ nvc0_screen_create(struct nouveau_device *dev)
 
    simple_mtx_init(&screen->state_lock, mtx_plain);
    screen->kick_draws = debug_get_num_option("NVC0_KICK_DRAWS", 128);
+   screen->threaded = debug_get_bool_option("NVC0_THREADED", false);
+   screen->base.threaded_buffers = screen->threaded;
+   slab_create_parent(&screen->transfer_pool, sizeof(struct threaded_transfer), 16);
 
    ret = nouveau_screen_init(&screen->base, dev);
    if (ret)
@@ -854,6 +883,7 @@ nvc0_screen_create(struct nouveau_device *dev)
    screen->fence.map = screen->fence.bo->map;
    screen->base.fence.emit = nvc0_screen_fence_emit;
    screen->base.fence.update = nvc0_screen_fence_update;
+   screen->base.fence_flush = nvc0_screen_fence_flush;
 
    if (dev->chipset < 0x140) {
       ret = nouveau_object_new(chan, (dev->chipset < 0xe0) ? 0x1f906e : 0x906e,

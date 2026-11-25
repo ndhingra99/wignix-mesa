@@ -13,6 +13,7 @@
 
 #include "util/os_mman.h"
 #include "util/os_time.h"
+#include "util/u_threaded_context.h"
 
 #include <stdio.h>
 #include <errno.h>
@@ -95,6 +96,9 @@ nouveau_screen_fence_finish(struct pipe_screen *screen,
 {
    if (!timeout)
       return nouveau_fence_signalled(nouveau_fence(pfence));
+
+   /* hand a threaded context to this thread for the duration of the wait */
+   threaded_context_unwrap_sync(ctx);
 
    return nouveau_fence_wait(nouveau_fence(pfence), NULL);
 }

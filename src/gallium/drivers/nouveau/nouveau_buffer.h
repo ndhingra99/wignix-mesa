@@ -4,6 +4,7 @@
 #include "util/u_range.h"
 #include "util/u_transfer.h"
 #include "util/list.h"
+#include "util/u_threaded_context.h"
 
 struct pipe_resource;
 struct nouveau_context;
@@ -32,7 +33,13 @@ struct nouveau_bo;
  * and this bo should be added to the memory manager's validation list.
  */
 struct nv04_resource {
-   struct pipe_resource base;
+   /* a threaded context needs its own resource data in front; base is the
+    * pipe_resource at the start of it
+    */
+   union {
+      struct threaded_resource tres;
+      struct pipe_resource base;
+   };
 
    uint64_t address; /* virtual address (nv50+) */
 

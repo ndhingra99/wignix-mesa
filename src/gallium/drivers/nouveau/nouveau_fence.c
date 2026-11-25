@@ -210,8 +210,12 @@ _nouveau_fence_signalled(struct nouveau_fence *fence)
    return fence->state == NOUVEAU_FENCE_STATE_SIGNALLED;
 }
 
-static bool
-nouveau_fence_kick(struct nouveau_fence *fence)
+/* Emits the fence if that has not happened and submits its context's pushbuf.
+ * With detached set the pushbuf's buffer contexts are left for its own thread
+ * to requeue (nouveau_pushbuf_kick_detached).
+ */
+bool
+_nouveau_fence_kick(struct nouveau_fence *fence, bool detached)
 {
    struct nouveau_context *context = fence->context;
    struct nouveau_screen *screen = fence->screen;
@@ -230,7 +234,8 @@ nouveau_fence_kick(struct nouveau_fence *fence)
    }
 
    if (fence->state < NOUVEAU_FENCE_STATE_FLUSHED) {
-      if (nouveau_pushbuf_kick(context->pushbuf))
+      if (detached ? nouveau_pushbuf_kick_detached(context->pushbuf) :
+                     nouveau_pushbuf_kick(context->pushbuf))
          return false;
    }
 
@@ -256,7 +261,7 @@ _nouveau_fence_wait(struct nouveau_fence *fence, struct util_debug_callback *deb
    if (debug && debug->debug_message)
       start = os_time_get_nano();
 
-   if (!nouveau_fence_kick(fence))
+   if (!_nouveau_fence_kick(fence, false))
       return false;
 
    if (fence->state < NOUVEAU_FENCE_STATE_SIGNALLED) {
@@ -331,11 +336,51 @@ nouveau_fence_work(struct nouveau_fence *fence,
    screen = fence->screen;
 
    simple_mtx_lock(&screen->fence.lock);
+   /* it may have signalled, and run its work, since the check above */
+   if (fence->state == NOUVEAU_FENCE_STATE_SIGNALLED) {
+      simple_mtx_unlock(&screen->fence.lock);
+      FREE(work);
+      func(data);
+      return true;
+   }
    list_add(&work->list, &fence->work);
-   if (++fence->work_count > 64)
-      nouveau_fence_kick(fence);
+   if (++fence->work_count > 64) {
+      /* This can run on any thread, so a context whose commands are written
+       * under a lock is only told to close the fence itself.
+       */
+      if (fence->context->fence_kick_deferred)
+         fence->context->fence_kick_wanted = true;
+      else
+         _nouveau_fence_kick(fence, false);
+   }
    simple_mtx_unlock(&screen->fence.lock);
    return true;
+}
+
+/* The context's current fence changes under the fence lock, possibly from
+ * another thread, so it is read there.
+ */
+void
+nouveau_fence_ref_current(struct nouveau_context *nv, struct nouveau_fence **ref)
+{
+   struct nouveau_fence_list *fence_list = &nv->screen->fence;
+
+   simple_mtx_lock(&fence_list->lock);
+   _nouveau_fence_ref(nv->fence, ref);
+   simple_mtx_unlock(&fence_list->lock);
+}
+
+bool
+nouveau_fence_work_current(struct nouveau_context *nv,
+                           void (*func)(void *), void *data)
+{
+   struct nouveau_fence *fence = NULL;
+   bool ret;
+
+   nouveau_fence_ref_current(nv, &fence);
+   ret = nouveau_fence_work(fence, func, data);
+   nouveau_fence_ref(NULL, &fence, nv->screen);
+   return ret;
 }
 
 void
@@ -367,7 +412,17 @@ nouveau_fence_ref(struct nouveau_fence *fence, struct nouveau_fence **ref,
 bool
 nouveau_fence_wait(struct nouveau_fence *fence, struct util_debug_callback *debug)
 {
-   struct nouveau_fence_list *fence_list = &fence->screen->fence;
+   struct nouveau_screen *screen = fence->screen;
+   struct nouveau_fence_list *fence_list = &screen->fence;
+
+   /* Emitting and submitting writes to the fence's context, which may belong
+    * to another thread: the screen does that part under its own rules.
+    */
+   if (screen->fence_flush && fence->state < NOUVEAU_FENCE_STATE_FLUSHED) {
+      if (!screen->fence_flush(fence))
+         return false;
+   }
+
    simple_mtx_lock(&fence_list->lock);
    bool res = _nouveau_fence_wait(fence, debug);
    simple_mtx_unlock(&fence_list->lock);

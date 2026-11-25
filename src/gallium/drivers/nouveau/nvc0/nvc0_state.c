@@ -830,6 +830,7 @@ nvc0_set_constant_buffer(struct pipe_context *pipe,
    if (cb) {
       nvc0->constbuf[s][i].offset = cb->buffer_offset;
       nvc0->constbuf[s][i].size = MIN2(align(cb->buffer_size, 0x100), 0x10000);
+      nvc0->constbuf[s][i].bytes = MIN2(cb->buffer_size, 0x10000);
       nvc0->constbuf_valid[s] |= 1 << i;
       if (res && res->flags & PIPE_RESOURCE_FLAG_MAP_COHERENT)
          nvc0->constbuf_coherent[s] |= 1 << i;

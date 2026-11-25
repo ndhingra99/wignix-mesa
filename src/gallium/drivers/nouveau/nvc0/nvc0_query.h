@@ -5,6 +5,8 @@
 
 #include "nouveau_context.h"
 
+#include "util/u_threaded_context.h"
+
 struct nvc0_context;
 struct nvc0_query;
 
@@ -24,6 +26,7 @@ struct nvc0_query_funcs {
 };
 
 struct nvc0_query {
+   struct threaded_query base;
    const struct nvc0_query_funcs *funcs;
    uint16_t type;
    uint16_t index;

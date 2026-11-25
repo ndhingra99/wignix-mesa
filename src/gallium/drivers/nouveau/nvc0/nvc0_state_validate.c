@@ -907,6 +907,37 @@ nvc0_constbufs_validate(struct nvc0_context *nvc0)
          } else {
             struct nv04_resource *res =
                nv04_resource(nvc0->constbuf[s][i].u.buf);
+
+            /* Slot 0 holds the GL uniforms.  Where the frontend uploads
+             * them itself (threaded contexts), each change arrives as a new
+             * range of a streaming buffer.  Binding that range costs the GPU
+             * a constant buffer switch and a cache flush per draw; copying
+             * it into the screen's uniform buffer, as for user constants,
+             * does not.
+             */
+            if (res && i == 0 &&
+                res->domain == NOUVEAU_BO_GART &&
+                res->base.usage == PIPE_USAGE_STREAM && res->bo->map) {
+               struct nouveau_bo *bo = nvc0->screen->uniform_bo;
+               const unsigned base = NVC0_CB_USR_INFO(s);
+               const unsigned size = nvc0->constbuf[s][0].bytes;
+
+               /* the copy does not follow later writes to the buffer */
+               nvc0->constbuf_coherent[s] &= ~1;
+
+               if (!nvc0->state.uniform_buffer_bound[s]) {
+                  nvc0->state.uniform_buffer_bound[s] = true;
+
+                  nvc0_screen_bind_cb_3d(nvc0->screen, push, &can_serialize, s, i,
+                                         NVC0_MAX_CONSTBUF_SIZE, bo->offset + base);
+               }
+               nvc0_cb_bo_push(&nvc0->base, bo, NV_VRAM_DOMAIN(&nvc0->screen->base),
+                               base, NVC0_MAX_CONSTBUF_SIZE,
+                               0, (size + 3) / 4,
+                               (const uint32_t *)((const uint8_t *)res->bo->map +
+                                                  res->offset +
+                                                  nvc0->constbuf[s][0].offset));
+            } else
             if (res) {
                nvc0_screen_bind_cb_3d(nvc0->screen, push, &can_serialize, s, i,
                                       nvc0->constbuf[s][i].size,

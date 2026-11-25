@@ -44,8 +44,8 @@ nvc0_hw_query_allocate(struct nvc0_context *nvc0, struct nvc0_query *q,
          if (hq->state == NVC0_HW_QUERY_STATE_READY)
             nouveau_mm_free(hq->mm);
          else
-            nouveau_fence_work(nvc0->base.fence,
-                               nouveau_mm_free_work, hq->mm);
+            nouveau_fence_work_current(&nvc0->base,
+                                       nouveau_mm_free_work, hq->mm);
       }
    }
    if (size) {
@@ -322,15 +322,23 @@ nvc0_hw_get_query_result(struct nvc0_context *nvc0, struct nvc0_query *q,
       nvc0_hw_query_update(nvc0->base.client, q);
 
    if (hq->state != NVC0_HW_QUERY_STATE_READY) {
+      /* A threaded context asks from the application's thread once the
+       * query's commands are submitted: leave the pushbuf alone then, and
+       * wait through the screen's client, which has none.
+       */
+      const bool submitted = q->base.flushed;
+
       if (!wait) {
          if (hq->state != NVC0_HW_QUERY_STATE_FLUSHED) {
             hq->state = NVC0_HW_QUERY_STATE_FLUSHED;
             /* flush for silly apps that spin on GL_QUERY_RESULT_AVAILABLE */
-            PUSH_KICK(nvc0->base.pushbuf);
+            if (!submitted)
+               PUSH_KICK(nvc0->base.pushbuf);
          }
          return false;
       }
-      if (BO_WAIT(&nvc0->screen->base, hq->bo, NOUVEAU_BO_RD, nvc0->base.client))
+      if (BO_WAIT(&nvc0->screen->base, hq->bo, NOUVEAU_BO_RD,
+                  submitted ? nvc0->screen->base.client : nvc0->base.client))
          return false;
       NOUVEAU_DRV_STAT(&nvc0->screen->base, query_sync_count, 1);
    }

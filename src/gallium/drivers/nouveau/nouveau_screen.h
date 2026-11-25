@@ -54,6 +54,17 @@ struct nouveau_screen {
    int64_t cpu_gpu_time_delta;
 
    bool hint_buf_keep_sysmem_copy;
+
+   /* Contexts run in a thread of their own, and the application's thread
+    * maps buffers without it: dynamic buffers start out in system memory,
+    * where that needs nothing from the context.
+    */
+   bool threaded_buffers;
+
+   /* Emit a fence and submit its context's commands on behalf of a thread
+    * that waits for it; unset where only the context's own thread does that.
+    */
+   bool (*fence_flush)(struct nouveau_fence *);
    bool tegra_sector_layout;
 
    unsigned vram_domain;

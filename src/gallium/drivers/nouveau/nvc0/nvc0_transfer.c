@@ -4,7 +4,10 @@
 #include "nvc0/nvc0_context.h"
 
 struct nvc0_transfer {
-   struct pipe_transfer base;
+   union {
+      struct threaded_transfer tt;
+      struct pipe_transfer base;
+   };
    struct nv50_m2mf_rect rect[2];
    uint32_t nblocksx;
    uint16_t nblocksy;
@@ -533,8 +536,8 @@ nvc0_miptree_transfer_unmap(struct pipe_context *pctx,
       NOUVEAU_DRV_STAT(&nvc0->screen->base, tex_transfers_wr, 1);
 
       /* Allow the copies above to finish executing before freeing the source */
-      nouveau_fence_work(nvc0->base.fence,
-                         nouveau_fence_unref_bo, tx->rect[1].bo);
+      nouveau_fence_work_current(&nvc0->base,
+                                 nouveau_fence_unref_bo, tx->rect[1].bo);
    } else {
       nouveau_bo_ref(NULL, &tx->rect[1].bo);
    }
