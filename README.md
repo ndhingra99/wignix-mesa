@@ -1,4 +1,4 @@
-# wignix-mesa
+# WigNix Mesa
 
 Mesa with the WigNix nouveau work: occlusion queries and a threaded
 context for the nvc0 gallium driver, and a Vulkan (NVK) port to Fermi.
